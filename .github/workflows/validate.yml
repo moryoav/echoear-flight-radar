@@ -1,0 +1,26 @@
+name: Validate
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  esphome:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install validation dependencies
+        run: python -m pip install "esphome==2026.8.0" -r requirements-map.txt
+      - name: Create placeholder secrets
+        run: cp secrets.example.yaml secrets.yaml
+      - name: Validate ESPHome configuration
+        run: esphome config echoear-flight-radar.yaml
+      - name: Validate Python sources
+        run: python -m py_compile tools/*.py components/async_flight_radar/*.py

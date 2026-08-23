@@ -1,0 +1,20 @@
+# ESPHome and PlatformIO build output
+.esphome/
+.pio/
+build/
+
+# Local credentials
+secrets.yaml
+*.secrets.yaml
+
+# Python caches and generated map data
+__pycache__/
+*.py[cod]
+*.overpass.json
+*.geojson
+
+# Editor and operating-system files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

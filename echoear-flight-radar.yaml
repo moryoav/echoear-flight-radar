@@ -1,0 +1,3166 @@
+substitutions:
+  name: echoear-flight-radar
+  friendly_name: EchoEar Flight Radar
+  imagewidth: "360"
+  imageheight: "360"
+  rotate_display: "0"
+  timezone: "Etc/UTC"
+  # These coordinates must match the center used by tools/generate_map.py.
+  # The bundled example map is centered on London Heathrow Airport.
+  map_center_latitude: "51.4700"
+  map_center_longitude: "-0.4543"
+
+esp32:
+  board: esp32-s3-devkitc-1
+  flash_size: 32MB
+  cpu_frequency: 240MHz
+  toolchain: esp-idf
+  framework:
+    type: esp-idf
+    advanced:
+      enable_idf_experimental_features: true
+      loop_task_stack_size: 16384
+      use_full_certificate_bundle: true
+    sdkconfig_options:
+      CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: "y"
+      CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  min_version: 2026.7.3
+  name_add_mac_suffix: false
+  compile_process_limit: 4
+  on_boot:
+    - priority: -100
+      then:
+        - text_sensor.template.publish:
+            id: flight_radar_status
+            state: "starting"
+        - script.execute: flight_radar_fetch
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components:
+      - async_flight_radar
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  level: DEBUG
+
+debug:
+  update_interval: 30s
+
+ota:
+  - platform: esphome
+    id: ota_esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    password: !secret wifi_password
+  on_connect:
+    - text_sensor.template.publish:
+        id: flight_radar_status
+        state: "waiting for Home Assistant"
+    - script.execute: flight_radar_fetch
+  on_disconnect:
+    - text_sensor.template.publish:
+        id: flight_radar_status
+        state: "offline"
+
+captive_portal:
+
+api:
+  on_client_connected:
+    - script.execute: flight_radar_fetch
+
+json:
+
+time:
+  - platform: sntp
+    id: device_time
+    timezone: ${timezone}
+
+async_flight_radar:
+  id: async_radar_http
+  aeroapi_key: !secret aeroapi_key
+  timeout: 10s
+  max_response_size: 32768
+  buffer_size_rx: 2048
+  buffer_size_tx: 512
+  on_response:
+    then:
+      - lambda: |-
+          id(flight_radar_fetch_in_progress) = false;
+          id(flight_radar_fetch_duration_ms) = duration_ms;
+          id(flight_radar_http_status_code) = status_code;
+          id(flight_radar_payload_bytes) = static_cast<int>(body_length);
+          id(flight_radar_fetch_duration_ms_sensor).publish_state(duration_ms);
+          id(flight_radar_http_status_sensor).publish_state(status_code);
+          id(flight_radar_payload_bytes_sensor).publish_state(body_length);
+
+          if (status_code != 200) {
+            char error[48];
+            snprintf(error, sizeof(error), "HTTP %d", status_code);
+            id(flight_radar_breadcrumb).publish_state(error);
+            id(flight_radar_status).publish_state("error");
+            id(flight_radar_last_error).publish_state(error);
+            return;
+          }
+
+          std::string payload;
+          payload.reserve(4096);
+          int count = 0;
+
+          auto parsed = json::parse_json(
+              reinterpret_cast<const uint8_t *>(body), body_length,
+              [&](JsonObject root) -> bool {
+                JsonArray aircraft = root["ac"].as<JsonArray>();
+                if (aircraft.isNull()) return true;
+
+                auto read_float = [](JsonObject object, const char *key,
+                                     float *value) -> bool {
+                  if (object[key].is<float>() || object[key].is<double>()
+                      || object[key].is<int>()) {
+                    *value = object[key].as<float>();
+                    return true;
+                  }
+                  return false;
+                };
+
+                auto clean = [](const char *input, size_t max_len) -> std::string {
+                  std::string output;
+                  if (input == nullptr || max_len == 0) return output;
+                  for (const char *p = input; *p != '\0' && output.size() < max_len; ++p) {
+                    char c = *p;
+                    if (c == '|' || c == ';' || c == '\r' || c == '\n' || c == '\t') {
+                      c = ' ';
+                    }
+                    if ((unsigned char) c < 32 || (unsigned char) c > 126) continue;
+                    output.push_back(c);
+                  }
+                  while (!output.empty() && output.back() == ' ') output.pop_back();
+                  return output;
+                };
+
+                for (JsonObject plane : aircraft) {
+                  if (count >= 48) break;
+
+                  float lat = 0.0f;
+                  float lon = 0.0f;
+                  if (!read_float(plane, "lat", &lat)
+                      || !read_float(plane, "lon", &lon)) {
+                    continue;
+                  }
+
+                  if (plane["alt_baro"].is<const char *>()) {
+                    const char *altitude = plane["alt_baro"].as<const char *>();
+                    if (altitude != nullptr && strcmp(altitude, "ground") == 0) continue;
+                  }
+
+                  float nose = 0.0f;
+                  float track = 0.0f;
+                  float ground_speed = 0.0f;
+                  float value = 0.0f;
+                  if (read_float(plane, "true_heading", &value)) nose = value;
+                  else if (read_float(plane, "mag_heading", &value)) nose = value;
+                  else if (read_float(plane, "track", &value)) nose = value;
+
+                  if (read_float(plane, "track", &value)) track = value;
+                  else if (read_float(plane, "true_heading", &value)) track = value;
+                  else if (read_float(plane, "mag_heading", &value)) track = value;
+
+                  if (read_float(plane, "gs", &value)) ground_speed = value;
+                  else if (read_float(plane, "tas", &value)) ground_speed = value;
+                  else if (read_float(plane, "ias", &value)) ground_speed = value;
+
+                  const std::string callsign = clean(
+                      plane["flight"].is<const char *>()
+                          ? plane["flight"].as<const char *>()
+                          : nullptr,
+                      10);
+                  const std::string hex = clean(
+                      plane["hex"].is<const char *>()
+                          ? plane["hex"].as<const char *>()
+                          : nullptr,
+                      9);
+                  const std::string type = clean(
+                      plane["t"].is<const char *>()
+                          ? plane["t"].as<const char *>()
+                          : nullptr,
+                      6);
+                  const std::string description = clean(
+                      plane["desc"].is<const char *>()
+                          ? plane["desc"].as<const char *>()
+                           : nullptr,
+                      34);
+                  const std::string registration = clean(
+                      plane["r"].is<const char *>()
+                          ? plane["r"].as<const char *>()
+                          : nullptr,
+                      15);
+
+                  char altitude[16] = "";
+                  float altitude_value = 0.0f;
+                  if (read_float(plane, "alt_baro", &altitude_value)
+                      || read_float(plane, "alt_geom", &altitude_value)) {
+                    snprintf(altitude, sizeof(altitude), "%d ft",
+                             (int) lroundf(altitude_value));
+                  }
+
+                  if (id(flight_detail_active)
+                      && !id(flight_detail_selected_hex).empty()
+                      && id(flight_detail_selected_hex) == hex) {
+                    id(flight_detail_selected_lat) = lat;
+                    id(flight_detail_selected_lon) = lon;
+                    id(flight_detail_selected_ground_speed) = ground_speed;
+                    id(flight_detail_selected_callsign) = callsign;
+                    id(flight_detail_selected_type) = type;
+                    id(flight_detail_selected_description) = description;
+                    id(flight_detail_selected_registration) = registration;
+                    id(flight_detail_selected_altitude) = altitude;
+                  }
+
+                  char record[240];
+                  snprintf(record, sizeof(record),
+                           "%.5f|%.5f|%.1f|%.1f|%.1f|%s|%s|%s|%s|%s|%s;",
+                           lat, lon, nose, track, ground_speed,
+                           callsign.c_str(), type.c_str(), altitude,
+                           hex.c_str(), description.c_str(), registration.c_str());
+                  payload += record;
+                  count++;
+                }
+                return true;
+              });
+
+          if (!parsed) {
+            id(flight_radar_breadcrumb).publish_state("json parse failed");
+            id(flight_radar_status).publish_state("error");
+            id(flight_radar_last_error).publish_state("JSON parse failed");
+            return;
+          }
+
+          id(flight_radar_aircraft_payload) = payload;
+          id(flight_radar_payload_generation)++;
+          id(flight_radar_last_success_ms) = millis();
+          id(flight_radar_aircraft_count).publish_state(count);
+          id(flight_radar_status).publish_state(count > 0 ? "ok" : "empty");
+          id(flight_radar_last_error).publish_state("");
+
+          char breadcrumb[64];
+          snprintf(breadcrumb, sizeof(breadcrumb),
+                   "fetch ok %ums %d ac %dB",
+                   (unsigned) duration_ms,
+                   count,
+                   id(flight_radar_payload_bytes));
+          id(flight_radar_breadcrumb).publish_state(breadcrumb);
+          id(flight_detail_prefetch).execute();
+  on_error:
+    then:
+      - lambda: |-
+          id(flight_radar_fetch_in_progress) = false;
+          id(flight_radar_fetch_duration_ms) = duration_ms;
+          id(flight_radar_http_status_code) = -1;
+          id(flight_radar_payload_bytes) = 0;
+          id(flight_radar_fetch_duration_ms_sensor).publish_state(duration_ms);
+          id(flight_radar_http_status_sensor).publish_state(-1);
+          id(flight_radar_payload_bytes_sensor).publish_state(0);
+          id(flight_radar_status).publish_state("error");
+          id(flight_radar_last_error).publish_state(error);
+
+          char breadcrumb[96];
+          snprintf(breadcrumb, sizeof(breadcrumb), "request failed: %.72s", error.c_str());
+          id(flight_radar_breadcrumb).publish_state(breadcrumb);
+  on_enrichment_response:
+    then:
+      - lambda: |-
+          id(flight_detail_fetch_in_progress) = false;
+
+          auto finish = [&]() {
+            if (id(flight_detail_active)) id(flight_detail_apply_cached).execute();
+            id(flight_detail_prefetch).execute();
+          };
+          auto unavailable = [&]() {
+            id(async_radar_http).store_enrichment_unavailable(callsign, aircraft_hex);
+            char breadcrumb[64];
+            snprintf(breadcrumb, sizeof(breadcrumb), "prefetch %.15s unavailable",
+                     callsign.c_str());
+            id(flight_radar_breadcrumb).publish_state(breadcrumb);
+            finish();
+          };
+
+          if (status_code == 404) {
+            unavailable();
+            return;
+          }
+          if (status_code != 200) {
+            id(async_radar_http).store_enrichment_error(callsign, aircraft_hex);
+            char breadcrumb[64];
+            snprintf(breadcrumb, sizeof(breadcrumb), "prefetch %.15s HTTP %d",
+                     callsign.c_str(), status_code);
+            id(flight_radar_breadcrumb).publish_state(breadcrumb);
+            finish();
+            return;
+          }
+
+          std::string airline_name;
+          std::string origin_city;
+          std::string origin_code;
+          std::string destination_city;
+          std::string destination_code;
+          float origin_lat = 0.0f;
+          float origin_lon = 0.0f;
+          float destination_lat = 0.0f;
+          float destination_lon = 0.0f;
+          bool route_present = false;
+          bool route_positions_valid = false;
+
+          auto parsed = json::parse_json(
+              reinterpret_cast<const uint8_t *>(body), body_length,
+              [&](JsonObject root) -> bool {
+                JsonObject response_object = root["response"].as<JsonObject>();
+                if (response_object.isNull()) return true;
+                JsonObject route = response_object["flightroute"].as<JsonObject>();
+                if (route.isNull()) return true;
+                route_present = true;
+
+                auto clean = [](const char *input, size_t max_len) -> std::string {
+                  std::string output;
+                  if (input == nullptr || max_len == 0) return output;
+                  for (const char *p = input;
+                       *p != '\0' && output.size() < max_len; ++p) {
+                    char character = *p;
+                    if (character == '|' || character == ';' || character == '\r'
+                        || character == '\n' || character == '\t') {
+                      character = ' ';
+                    }
+                    if ((unsigned char) character < 32
+                        || (unsigned char) character > 126) continue;
+                    output.push_back(character);
+                  }
+                  while (!output.empty() && output.back() == ' ') output.pop_back();
+                  size_t first = 0;
+                  while (first < output.size() && output[first] == ' ') first++;
+                  if (first > 0) output.erase(0, first);
+                  return output;
+                };
+
+                auto read_coordinate = [](JsonObject object, const char *key,
+                                          float *value) -> bool {
+                  if (object[key].is<float>() || object[key].is<double>()
+                      || object[key].is<int>()) {
+                    *value = object[key].as<float>();
+                    return true;
+                  }
+                  return false;
+                };
+
+                JsonObject airline = route["airline"].as<JsonObject>();
+                JsonObject origin = route["origin"].as<JsonObject>();
+                JsonObject destination = route["destination"].as<JsonObject>();
+                if (origin.isNull() || destination.isNull()) return true;
+
+                airline_name = airline.isNull()
+                    ? ""
+                    : clean(airline["name"].is<const char *>()
+                                ? airline["name"].as<const char *>()
+                                : nullptr,
+                            32);
+                origin_city = clean(
+                    origin["municipality"].is<const char *>()
+                        ? origin["municipality"].as<const char *>()
+                        : nullptr,
+                    24);
+                if (origin_city.empty()) {
+                  origin_city = clean(
+                      origin["name"].is<const char *>()
+                          ? origin["name"].as<const char *>()
+                          : nullptr,
+                      24);
+                }
+                origin_code = clean(
+                    origin["iata_code"].is<const char *>()
+                        ? origin["iata_code"].as<const char *>()
+                        : nullptr,
+                    5);
+                if (origin_code.empty()) {
+                  origin_code = clean(
+                      origin["icao_code"].is<const char *>()
+                          ? origin["icao_code"].as<const char *>()
+                          : nullptr,
+                      5);
+                }
+                destination_city = clean(
+                    destination["municipality"].is<const char *>()
+                        ? destination["municipality"].as<const char *>()
+                        : nullptr,
+                    24);
+                if (destination_city.empty()) {
+                  destination_city = clean(
+                      destination["name"].is<const char *>()
+                          ? destination["name"].as<const char *>()
+                          : nullptr,
+                      24);
+                }
+                destination_code = clean(
+                    destination["iata_code"].is<const char *>()
+                        ? destination["iata_code"].as<const char *>()
+                        : nullptr,
+                    5);
+                if (destination_code.empty()) {
+                  destination_code = clean(
+                      destination["icao_code"].is<const char *>()
+                          ? destination["icao_code"].as<const char *>()
+                          : nullptr,
+                      5);
+                }
+
+                route_positions_valid =
+                    read_coordinate(origin, "latitude", &origin_lat)
+                    && read_coordinate(origin, "longitude", &origin_lon)
+                    && read_coordinate(destination, "latitude", &destination_lat)
+                    && read_coordinate(destination, "longitude", &destination_lon);
+                return true;
+              });
+
+          if (!parsed) {
+            id(async_radar_http).store_enrichment_error(callsign, aircraft_hex);
+            id(flight_radar_breadcrumb).publish_state("prefetch JSON error");
+            finish();
+            return;
+          }
+          if (!route_present || origin_city.empty() || destination_city.empty()) {
+            unavailable();
+            return;
+          }
+
+          id(async_radar_http).store_enrichment_ready(
+              callsign, aircraft_hex, airline_name,
+              origin_city, origin_code, origin_lat, origin_lon,
+              destination_city, destination_code,
+              destination_lat, destination_lon, route_positions_valid);
+          char breadcrumb[64];
+          snprintf(breadcrumb, sizeof(breadcrumb), "prefetch %.15s ready",
+                   callsign.c_str());
+          id(flight_radar_breadcrumb).publish_state(breadcrumb);
+          finish();
+  on_enrichment_error:
+    then:
+      - lambda: |-
+          id(flight_detail_fetch_in_progress) = false;
+          id(async_radar_http).store_enrichment_error(callsign, aircraft_hex);
+          char breadcrumb[80];
+          snprintf(breadcrumb, sizeof(breadcrumb), "prefetch %.15s failed: %.36s",
+                   callsign.c_str(), error.c_str());
+          id(flight_radar_breadcrumb).publish_state(breadcrumb);
+          if (id(flight_detail_active)) id(flight_detail_apply_cached).execute();
+          id(flight_detail_prefetch).execute();
+  on_flight_times_response:
+    then:
+      - lambda: |-
+          id(flight_times_http_status_sensor).publish_state(status_code);
+          id(flight_times_request_duration_sensor).publish_state(duration_ms);
+          id(flight_times_last_error_sensor).publish_state("");
+
+          auto publish_status = [&](const char *status) {
+            id(flight_times_status) = status;
+            id(flight_times_status_sensor).publish_state(status);
+          };
+          auto record_failure = [&](const char *status, const char *message) {
+            id(flight_times_failures)++;
+            publish_status(status);
+            id(flight_radar_breadcrumb).publish_state(message);
+          };
+
+          if (status_code != 200) {
+            char message[64];
+            snprintf(message, sizeof(message), "AeroAPI %.15s HTTP %d",
+                     callsign.c_str(), status_code);
+            id(flight_times_last_error_sensor).publish_state(message);
+            record_failure("http_error", message);
+            return;
+          }
+
+          const auto now = id(device_time).now();
+          if (!now.is_valid()) {
+            record_failure("clock_error", "AeroAPI response without valid clock");
+            return;
+          }
+          const int64_t now_epoch = static_cast<int64_t>(now.timestamp);
+
+          auto normalize = [](const std::string &input) -> std::string {
+            std::string output;
+            output.reserve(input.size());
+            for (char character : input) {
+              if (character >= 'a' && character <= 'z') character -= 'a' - 'A';
+              if ((character >= 'A' && character <= 'Z')
+                  || (character >= '0' && character <= '9')) {
+                output.push_back(character);
+              }
+            }
+            return output;
+          };
+          auto read_text = [](JsonObject object, const char *key) -> std::string {
+            if (!object[key].is<const char *>()) return "";
+            const char *value = object[key].as<const char *>();
+            return value == nullptr ? "" : std::string(value);
+          };
+          auto parse_utc = [](const std::string &value) -> int64_t {
+            int year = 0;
+            int month = 0;
+            int day = 0;
+            int hour = 0;
+            int minute = 0;
+            int second = 0;
+            if (sscanf(value.c_str(), "%d-%d-%dT%d:%d:%d",
+                       &year, &month, &day, &hour, &minute, &second) != 6) {
+              return 0;
+            }
+            if (year < 1970 || month < 1 || month > 12 || day < 1 || day > 31
+                || hour < 0 || hour > 23 || minute < 0 || minute > 59
+                || second < 0 || second > 60) {
+              return 0;
+            }
+            const int adjusted_year = year - (month <= 2 ? 1 : 0);
+            const int era = (adjusted_year >= 0 ? adjusted_year : adjusted_year - 399) / 400;
+            const unsigned year_of_era = static_cast<unsigned>(adjusted_year - era * 400);
+            const unsigned shifted_month = static_cast<unsigned>(month + (month > 2 ? -3 : 9));
+            const unsigned day_of_year =
+                (153U * shifted_month + 2U) / 5U + static_cast<unsigned>(day) - 1U;
+            const unsigned day_of_era =
+                year_of_era * 365U + year_of_era / 4U - year_of_era / 100U
+                + day_of_year;
+            const int64_t days = static_cast<int64_t>(era) * 146097LL
+                + static_cast<int64_t>(day_of_era) - 719468LL;
+            return days * 86400LL + hour * 3600LL + minute * 60LL + second;
+          };
+
+          const std::string requested_callsign = normalize(callsign);
+          const std::string requested_registration = normalize(registration);
+          const bool same_selection =
+              (!aircraft_hex.empty() && aircraft_hex == id(flight_detail_selected_hex))
+              || (aircraft_hex.empty()
+                  && requested_callsign == normalize(id(flight_detail_selected_callsign)));
+          const std::string expected_origin =
+              same_selection && id(flight_detail_route_status) == "ready"
+                  ? normalize(id(flight_detail_origin_code))
+                  : "";
+          const std::string expected_destination =
+              same_selection && id(flight_detail_route_status) == "ready"
+                  ? normalize(id(flight_detail_destination_code))
+                  : "";
+
+          auto airport_matches = [&](JsonObject airport,
+                                     const std::string &expected) -> bool {
+            if (expected.empty()) return true;
+            if (airport.isNull()) return false;
+            return normalize(read_text(airport, "code")) == expected
+                || normalize(read_text(airport, "code_icao")) == expected
+                || normalize(read_text(airport, "code_iata")) == expected
+                || normalize(read_text(airport, "code_lid")) == expected;
+          };
+
+          int best_score = -1;
+          bool best_tied = false;
+          int64_t best_actual_off = 0;
+          int64_t best_estimated_on = 0;
+          std::string best_ident;
+
+          const bool parsed = json::parse_json(
+              reinterpret_cast<const uint8_t *>(body), body_length,
+              [&](JsonObject root) -> bool {
+                JsonArray flights = root["flights"].as<JsonArray>();
+                if (flights.isNull()) return true;
+
+                for (JsonObject flight : flights) {
+                  const std::string ident = normalize(read_text(flight, "ident"));
+                  const std::string ident_icao = normalize(read_text(flight, "ident_icao"));
+                  const std::string atc_ident = normalize(read_text(flight, "atc_ident"));
+                  const std::string candidate_registration =
+                      normalize(read_text(flight, "registration"));
+
+                  int score = -1;
+                  if (!atc_ident.empty() && atc_ident == requested_callsign) score = 120;
+                  else if ((!ident_icao.empty() && ident_icao == requested_callsign)
+                           || (!ident.empty() && ident == requested_callsign)) score = 100;
+                  else if (!requested_registration.empty()
+                           && candidate_registration == requested_registration) score = 60;
+                  if (score < 0) continue;
+
+                  if (!requested_registration.empty()
+                      && !candidate_registration.empty()
+                      && candidate_registration != requested_registration) {
+                    continue;
+                  }
+                  if (!requested_registration.empty()
+                      && candidate_registration == requested_registration) score += 40;
+
+                  const int64_t actual_off =
+                      parse_utc(read_text(flight, "actual_off"));
+                  const int64_t estimated_on =
+                      parse_utc(read_text(flight, "estimated_on"));
+                  const int64_t actual_on =
+                      parse_utc(read_text(flight, "actual_on"));
+                  if (actual_off <= 0 || estimated_on <= 0 || actual_on > 0) continue;
+                  if (actual_off > now_epoch + 15LL * 60LL
+                      || estimated_on < now_epoch - 2LL * 60LL * 60LL) {
+                    continue;
+                  }
+
+                  JsonObject origin = flight["origin"].as<JsonObject>();
+                  JsonObject destination = flight["destination"].as<JsonObject>();
+                  if (!expected_origin.empty()
+                      && airport_matches(origin, expected_origin)) score += 15;
+                  if (!expected_destination.empty()
+                      && airport_matches(destination, expected_destination)) score += 15;
+
+                  const std::string status = read_text(flight, "status");
+                  if (status.find("En Route") != std::string::npos) score += 10;
+                  if (flight["progress_percent"].is<int>()) {
+                    const int progress = flight["progress_percent"].as<int>();
+                    if (progress > 0 && progress < 100) score += 5;
+                  }
+
+                  if (score > best_score) {
+                    best_score = score;
+                    best_tied = false;
+                    best_actual_off = actual_off;
+                    best_estimated_on = estimated_on;
+                    best_ident = ident.empty() ? ident_icao : ident;
+                  } else if (score == best_score) {
+                    best_tied = true;
+                  }
+                }
+                return true;
+              });
+
+          if (!parsed) {
+            id(flight_times_last_error_sensor).publish_state("JSON parse failed");
+            record_failure("parse_error", "AeroAPI JSON parse failed");
+            return;
+          }
+          if (best_score < 0 || best_tied) {
+            publish_status("unavailable");
+            char message[72];
+            snprintf(message, sizeof(message), "AeroAPI %.15s %s",
+                     callsign.c_str(), best_tied ? "ambiguous" : "no active match");
+            id(flight_radar_breadcrumb).publish_state(message);
+            return;
+          }
+
+          id(flight_times_cache_key) = aircraft_hex.empty()
+              ? requested_callsign
+              : normalize(aircraft_hex);
+          id(flight_times_actual_off_epoch) = best_actual_off;
+          id(flight_times_estimated_on_epoch) = best_estimated_on;
+          id(flight_times_cached_at_ms) = millis();
+          publish_status("ready");
+
+          char message[80];
+          snprintf(message, sizeof(message), "AeroAPI %.15s ready as %.15s",
+                   callsign.c_str(), best_ident.c_str());
+          id(flight_radar_breadcrumb).publish_state(message);
+  on_flight_times_error:
+    then:
+      - lambda: |-
+          id(flight_times_failures)++;
+          id(flight_times_status) = "transport_error";
+          id(flight_times_status_sensor).publish_state("transport_error");
+          id(flight_times_http_status_sensor).publish_state(-1);
+          id(flight_times_request_duration_sensor).publish_state(duration_ms);
+          id(flight_times_last_error_sensor).publish_state(error);
+          char message[88];
+          snprintf(message, sizeof(message), "AeroAPI %.15s failed: %.42s",
+                   callsign.c_str(), error.c_str());
+          id(flight_radar_breadcrumb).publish_state(message);
+
+button:
+  - platform: restart
+    name: "Restart"
+    entity_category: diagnostic
+
+sensor:
+  - platform: uptime
+    id: debug_uptime
+    name: "Debug Uptime"
+    update_interval: 10s
+    entity_category: diagnostic
+
+  - platform: template
+    id: battery_voltage
+    name: "Battery Voltage"
+    unit_of_measurement: "V"
+    accuracy_decimals: 2
+    device_class: voltage
+    state_class: measurement
+    update_interval: never
+    on_value:
+      - sensor.template.publish:
+          id: battery_percentage
+          state: !lambda return x;
+
+  - platform: template
+    id: battery_percentage
+    name: "Battery Percentage"
+    update_interval: never
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    device_class: battery
+    state_class: measurement
+    filters:
+      - calibrate_linear:
+          method: exact
+          datapoints:
+            - 2.80 -> 0.0
+            - 3.10 -> 10.0
+            - 3.30 -> 20.0
+            - 3.45 -> 30.0
+            - 3.60 -> 40.0
+            - 3.70 -> 50.0
+            - 3.75 -> 60.0
+            - 3.80 -> 70.0
+            - 3.90 -> 80.0
+            - 4.00 -> 90.0
+            - 4.20 -> 100.0
+      - lambda: |-
+          if (x > 100.0f) return 100.0f;
+          if (x < 0.0f) return 0.0f;
+          return x;
+
+  - platform: template
+    id: flight_radar_aircraft_count
+    name: "Flight Radar Aircraft"
+    icon: "mdi:airplane-marker"
+    accuracy_decimals: 0
+    update_interval: never
+    entity_category: diagnostic
+
+  - platform: template
+    id: flight_radar_runway_count
+    name: "Flight Radar Runways"
+    icon: "mdi:airport"
+    accuracy_decimals: 0
+    update_interval: never
+    entity_category: diagnostic
+
+  - platform: template
+    id: flight_radar_data_age
+    name: "Flight Radar Data Age"
+    icon: "mdi:timer-outline"
+    unit_of_measurement: "s"
+    accuracy_decimals: 0
+    update_interval: 1s
+    entity_category: diagnostic
+    lambda: |-
+      if (id(flight_radar_last_success_ms) == 0) return NAN;
+      return (float) ((millis() - id(flight_radar_last_success_ms)) / 1000UL);
+
+  - platform: template
+    id: flight_radar_fetch_duration_ms_sensor
+    name: "Flight Radar Fetch Duration"
+    icon: "mdi:timer-sync-outline"
+    unit_of_measurement: "ms"
+    accuracy_decimals: 0
+    update_interval: never
+    entity_category: diagnostic
+
+  - platform: template
+    id: flight_radar_http_status_sensor
+    name: "Flight Radar HTTP Status"
+    icon: "mdi:web"
+    accuracy_decimals: 0
+    update_interval: never
+    entity_category: diagnostic
+
+  - platform: template
+    id: flight_radar_payload_bytes_sensor
+    name: "Flight Radar Payload Bytes"
+    icon: "mdi:file-document-outline"
+    unit_of_measurement: "B"
+    accuracy_decimals: 0
+    update_interval: never
+    entity_category: diagnostic
+
+  - platform: template
+    id: flight_radar_http_step_max_duration_ms_sensor
+    name: "Flight Radar Main Handoff Max Duration"
+    icon: "mdi:timer-alert-outline"
+    unit_of_measurement: "ms"
+    accuracy_decimals: 1
+    update_interval: 10s
+    entity_category: diagnostic
+    lambda: return id(async_radar_http).get_max_step_duration_ms();
+
+  - platform: template
+    id: flight_radar_worker_stack_free_sensor
+    name: "Flight Radar Worker Stack Free"
+    icon: "mdi:memory"
+    unit_of_measurement: "B"
+    accuracy_decimals: 0
+    update_interval: 10s
+    entity_category: diagnostic
+    lambda: return id(async_radar_http).get_worker_stack_high_water_bytes();
+
+  - platform: template
+    id: flight_radar_http_failures_sensor
+    name: "Flight Radar HTTP Failures"
+    icon: "mdi:alert-outline"
+    accuracy_decimals: 0
+    update_interval: 10s
+    entity_category: diagnostic
+    lambda: return id(async_radar_http).get_failure_count();
+
+  - platform: template
+    id: flight_detail_http_failures_sensor
+    name: "Flight Detail HTTP Failures"
+    icon: "mdi:alert-outline"
+    accuracy_decimals: 0
+    update_interval: 10s
+    entity_category: diagnostic
+    lambda: return id(async_radar_http).get_enrichment_failure_count();
+
+  - platform: template
+    id: flight_detail_cache_ready_sensor
+    name: "Flight Detail Cache Ready"
+    icon: "mdi:database-check-outline"
+    accuracy_decimals: 0
+    update_interval: 10s
+    entity_category: diagnostic
+    lambda: return id(async_radar_http).get_enrichment_cache_ready_count();
+
+  - platform: template
+    id: flight_times_request_duration_sensor
+    name: "FlightAware Request Duration"
+    icon: "mdi:timer-sync-outline"
+    unit_of_measurement: "ms"
+    accuracy_decimals: 0
+    update_interval: never
+    entity_category: diagnostic
+
+  - platform: template
+    id: flight_times_http_status_sensor
+    name: "FlightAware HTTP Status"
+    icon: "mdi:web"
+    accuracy_decimals: 0
+    update_interval: never
+    entity_category: diagnostic
+
+  - platform: template
+    id: flight_times_failures_sensor
+    name: "FlightAware Failures"
+    icon: "mdi:alert-outline"
+    accuracy_decimals: 0
+    update_interval: 10s
+    entity_category: diagnostic
+    lambda: return id(flight_times_failures);
+
+  - platform: template
+    id: flight_radar_display_duration_ms_sensor
+    name: "Flight Radar Display Duration"
+    icon: "mdi:monitor-dashboard"
+    unit_of_measurement: "ms"
+    accuracy_decimals: 0
+    update_interval: never
+    entity_category: diagnostic
+
+  - platform: template
+    id: flight_radar_display_max_duration_ms_sensor
+    name: "Flight Radar Display Max Duration"
+    icon: "mdi:timer-alert-outline"
+    unit_of_measurement: "ms"
+    accuracy_decimals: 0
+    update_interval: never
+    entity_category: diagnostic
+
+  - platform: template
+    id: flight_radar_display_planes_sensor
+    name: "Flight Radar Display Planes"
+    icon: "mdi:airplane"
+    accuracy_decimals: 0
+    update_interval: never
+    entity_category: diagnostic
+
+  - platform: template
+    id: flight_radar_display_labels_sensor
+    name: "Flight Radar Display Labels"
+    icon: "mdi:label-outline"
+    accuracy_decimals: 0
+    update_interval: never
+    entity_category: diagnostic
+
+  - platform: template
+    id: flight_radar_display_degraded_labels_sensor
+    name: "Flight Radar Display Degraded Labels"
+    icon: "mdi:label-off-outline"
+    accuracy_decimals: 0
+    update_interval: never
+    entity_category: diagnostic
+
+  - platform: template
+    id: flight_radar_display_skipped_labels_sensor
+    name: "Flight Radar Display Skipped Labels"
+    icon: "mdi:label-remove-outline"
+    accuracy_decimals: 0
+    update_interval: never
+    entity_category: diagnostic
+
+  - platform: debug
+    free:
+      name: "Debug Heap Free"
+    block:
+      name: "Debug Heap Largest Block"
+    fragmentation:
+      name: "Debug Heap Fragmentation"
+    min_free:
+      name: "Debug Heap Min Free"
+    loop_time:
+      name: "Debug Loop Time"
+    psram:
+      name: "Debug PSRAM Free"
+
+  - platform: homeassistant
+    id: ha_home_latitude
+    entity_id: zone.home
+    attribute: latitude
+    internal: true
+    on_value:
+      - script.execute: flight_radar_fetch
+
+  - platform: homeassistant
+    id: ha_home_longitude
+    entity_id: zone.home
+    attribute: longitude
+    internal: true
+    on_value:
+      - script.execute: flight_radar_fetch
+
+binary_sensor:
+  - platform: status
+    name: "Status"
+    entity_category: diagnostic
+
+  - platform: esp32_touch
+    id: top_touch_pad1
+    name: "Top Touch Pad 1"
+    pin: GPIO6
+    threshold: 2000
+    filters:
+      - delayed_on: 15ms
+      - delayed_off: 60ms
+
+  - platform: esp32_touch
+    id: top_touch_pad2
+    name: "Top Touch Pad 2"
+    pin: GPIO7
+    threshold: 2000
+    filters:
+      - delayed_on: 15ms
+      - delayed_off: 60ms
+
+  - platform: gpio
+    id: left_button
+    name: "Left Button"
+    pin:
+      number: GPIO0
+      mode: INPUT_PULLUP
+      ignore_strapping_warning: true
+      inverted: true
+    filters:
+      - delayed_on: 20ms
+      - delayed_off: 20ms
+
+  - platform: template
+    id: touch_input
+    name: "Touch Button"
+
+  - platform: template
+    id: swipe_left
+    name: "Swipe Left"
+    device_class: moving
+
+  - platform: template
+    id: swipe_right
+    name: "Swipe Right"
+    device_class: moving
+
+  - platform: template
+    id: swipe_up
+    name: "Swipe Up"
+    device_class: moving
+
+  - platform: template
+    id: swipe_down
+    name: "Swipe Down"
+    device_class: moving
+
+output:
+  - platform: ledc
+    id: backlight_output
+    pin: GPIO44
+    inverted: false
+
+power_supply:
+  - id: vcc3v3_sw
+    pin:
+      number: GPIO9
+      inverted: true
+    enable_time: 150ms
+    enable_on_boot: true
+
+light:
+  - platform: monochromatic
+    id: screen_backlight
+    name: "Screen"
+    icon: "mdi:television"
+    entity_category: config
+    output: backlight_output
+    restore_mode: ALWAYS_ON
+    default_transition_length: 250ms
+
+switch:
+  - platform: gpio
+    id: top_green_led
+    name: "Top Green LED"
+    pin:
+      number: GPIO43
+      inverted: true
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  - platform: template
+    id: flight_radar_show_runways
+    name: "Flight Radar Show Runways"
+    icon: "mdi:airport"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+
+select:
+  - platform: template
+    id: flight_radar_range
+    name: "Flight Radar Range"
+    icon: "mdi:radar"
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    options:
+      - 5 km
+      - 10 km
+      - 15 km
+      - 25 km
+    initial_option: 10 km
+
+  - platform: template
+    id: flight_radar_units
+    name: "Flight Radar Units"
+    icon: "mdi:map-marker-distance"
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    options:
+      - km
+      - mi
+    initial_option: km
+
+globals:
+  - id: flight_radar_aircraft_payload
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+
+  - id: flight_radar_payload_generation
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+  - id: flight_radar_fetch_in_progress
+    type: bool
+    restore_value: false
+    initial_value: "false"
+
+  - id: flight_radar_last_fetch_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+  - id: flight_radar_last_success_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+  - id: flight_radar_last_runway_count
+    type: int
+    restore_value: false
+    initial_value: "-1"
+
+  - id: flight_radar_fetch_started_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+  - id: flight_radar_fetch_duration_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+  - id: flight_radar_http_status_code
+    type: int
+    restore_value: false
+    initial_value: "0"
+
+  - id: flight_radar_payload_bytes
+    type: int
+    restore_value: false
+    initial_value: "0"
+
+  - id: flight_radar_frame_started_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+  - id: flight_radar_frame_duration_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+  - id: flight_radar_frame_max_duration_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+  - id: flight_radar_frame_last_diag_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+  - id: flight_radar_frame_planes
+    type: int
+    restore_value: false
+    initial_value: "0"
+
+  - id: flight_radar_frame_labels
+    type: int
+    restore_value: false
+    initial_value: "0"
+
+  - id: flight_radar_frame_degraded_labels
+    type: int
+    restore_value: false
+    initial_value: "0"
+
+  - id: flight_radar_frame_skipped_labels
+    type: int
+    restore_value: false
+    initial_value: "0"
+
+  - id: flight_radar_hit_count
+    type: int
+    restore_value: false
+    initial_value: "0"
+
+  - id: flight_radar_hit_x
+    type: std::array<int16_t, 48>
+    restore_value: false
+    initial_value: "std::array<int16_t, 48>{}"
+
+  - id: flight_radar_hit_y
+    type: std::array<int16_t, 48>
+    restore_value: false
+    initial_value: "std::array<int16_t, 48>{}"
+
+  - id: flight_radar_hit_label_x0
+    type: std::array<int16_t, 48>
+    restore_value: false
+    initial_value: "std::array<int16_t, 48>{}"
+
+  - id: flight_radar_hit_label_y0
+    type: std::array<int16_t, 48>
+    restore_value: false
+    initial_value: "std::array<int16_t, 48>{}"
+
+  - id: flight_radar_hit_label_x1
+    type: std::array<int16_t, 48>
+    restore_value: false
+    initial_value: "std::array<int16_t, 48>{}"
+
+  - id: flight_radar_hit_label_y1
+    type: std::array<int16_t, 48>
+    restore_value: false
+    initial_value: "std::array<int16_t, 48>{}"
+
+  - id: flight_radar_hit_plane_index
+    type: std::array<uint8_t, 48>
+    restore_value: false
+    initial_value: "std::array<uint8_t, 48>{}"
+
+  - id: flight_radar_hit_generation
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+  - id: flight_detail_active
+    type: bool
+    restore_value: false
+    initial_value: "false"
+
+  - id: flight_detail_last_interaction_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+  - id: flight_detail_fetch_in_progress
+    type: bool
+    restore_value: false
+    initial_value: "false"
+
+  - id: flight_detail_route_status
+    type: std::string
+    restore_value: false
+    initial_value: '"idle"'
+
+  - id: flight_detail_route_key
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+
+  - id: flight_detail_selected_hex
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+
+  - id: flight_detail_selected_callsign
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+
+  - id: flight_detail_selected_type
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+
+  - id: flight_detail_selected_description
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+
+  - id: flight_detail_selected_registration
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+
+  - id: flight_detail_selected_altitude
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+
+  - id: flight_detail_selected_lat
+    type: float
+    restore_value: false
+    initial_value: "0.0"
+
+  - id: flight_detail_selected_lon
+    type: float
+    restore_value: false
+    initial_value: "0.0"
+
+  - id: flight_detail_selected_ground_speed
+    type: float
+    restore_value: false
+    initial_value: "0.0"
+
+  - id: flight_detail_route_valid
+    type: bool
+    restore_value: false
+    initial_value: "false"
+
+  - id: flight_detail_airline
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+
+  - id: flight_detail_origin_city
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+
+  - id: flight_detail_origin_code
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+
+  - id: flight_detail_origin_lat
+    type: float
+    restore_value: false
+    initial_value: "0.0"
+
+  - id: flight_detail_origin_lon
+    type: float
+    restore_value: false
+    initial_value: "0.0"
+
+  - id: flight_detail_destination_city
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+
+  - id: flight_detail_destination_code
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+
+  - id: flight_detail_destination_lat
+    type: float
+    restore_value: false
+    initial_value: "0.0"
+
+  - id: flight_detail_destination_lon
+    type: float
+    restore_value: false
+    initial_value: "0.0"
+
+  - id: flight_times_status
+    type: std::string
+    restore_value: false
+    initial_value: '"idle"'
+
+  - id: flight_times_cache_key
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+
+  - id: flight_times_actual_off_epoch
+    type: int64_t
+    restore_value: false
+    initial_value: "0"
+
+  - id: flight_times_estimated_on_epoch
+    type: int64_t
+    restore_value: false
+    initial_value: "0"
+
+  - id: flight_times_cached_at_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+  - id: flight_times_last_request_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+  - id: flight_times_failures
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+  - id: touch_active
+    type: bool
+    restore_value: false
+    initial_value: "false"
+
+  - id: touch_start_x
+    type: int
+    restore_value: false
+    initial_value: "0"
+
+  - id: touch_start_y
+    type: int
+    restore_value: false
+    initial_value: "0"
+
+  - id: touch_last_x
+    type: int
+    restore_value: false
+    initial_value: "0"
+
+  - id: touch_last_y
+    type: int
+    restore_value: false
+    initial_value: "0"
+
+  - id: touch_start_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+font:
+  - file:
+      type: gfonts
+      family: Figtree
+      weight: 400
+    id: font_radar_small
+    size: 14
+    glyphsets:
+      - GF_Latin_Core
+
+  - file:
+      type: gfonts
+      family: Figtree
+      weight: 400
+    id: font_radar_large
+    size: 22
+    glyphsets:
+      - GF_Latin_Core
+
+  - file:
+      type: gfonts
+      family: Figtree
+      weight: 600
+    id: font_detail_value
+    size: 18
+    glyphsets:
+      - GF_Latin_Core
+
+image:
+  - platform: file
+    file: assets/flight_radar_map_10km.png
+    id: flight_radar_map_10km
+    type: RGB565
+
+  - platform: file
+    file: assets/flight_radar_plane.png
+    id: flight_radar_plane_icon
+    type: RGB565
+    transparency: alpha_channel
+
+text_sensor:
+  - platform: template
+    id: flight_radar_status
+    name: "Flight Radar Status"
+    icon: "mdi:radar"
+    entity_category: diagnostic
+
+  - platform: template
+    id: flight_radar_last_error
+    name: "Flight Radar Last Error"
+    icon: "mdi:alert-circle-outline"
+    entity_category: diagnostic
+
+  - platform: template
+    id: flight_radar_breadcrumb
+    name: "Flight Radar Breadcrumb"
+    icon: "mdi:map-marker-path"
+    entity_category: diagnostic
+
+  - platform: template
+    id: flight_times_status_sensor
+    name: "FlightAware Status"
+    icon: "mdi:airplane-clock"
+    entity_category: diagnostic
+
+  - platform: template
+    id: flight_times_last_error_sensor
+    name: "FlightAware Last Error"
+    icon: "mdi:alert-circle-outline"
+    entity_category: diagnostic
+
+  - platform: debug
+    reset_reason:
+      name: "Debug Reset Reason"
+
+interval:
+  - interval: 2s
+    then:
+      - script.execute: flight_detail_prefetch
+
+  - interval: 5s
+    then:
+      - script.execute: flight_radar_fetch
+
+  - interval: 60s
+    then:
+      - lambda: |-
+          using esphome::i2c::ERROR_OK;
+          constexpr uint8_t BQ_ADDR = 0x55;
+          constexpr uint8_t REG_VOLTAGE = 0x08;
+          uint8_t reg = REG_VOLTAGE;
+          uint8_t rx[2] = {0};
+
+          if (id(bus_a)->write(BQ_ADDR, &reg, 1) != ERROR_OK) {
+            ESP_LOGW("bq27220", "I2C write failed");
+            return;
+          }
+          delayMicroseconds(200);
+          if (id(bus_a)->read(BQ_ADDR, rx, 2) != ERROR_OK) {
+            ESP_LOGW("bq27220", "I2C read failed");
+            return;
+          }
+
+          const uint16_t mv = (uint16_t(rx[1]) << 8) | rx[0];
+          id(battery_voltage).publish_state(mv / 1000.0f);
+
+script:
+  - id: flight_radar_fetch
+    mode: single
+    then:
+      - if:
+          condition:
+            and:
+              - wifi.connected:
+              - lambda: |-
+                  return !id(flight_radar_fetch_in_progress)
+                      && !id(async_radar_http).is_flight_times_running()
+                      && id(ha_home_latitude).has_state()
+                      && id(ha_home_longitude).has_state()
+                      && (id(flight_radar_last_fetch_ms) == 0
+                          || millis() - id(flight_radar_last_fetch_ms) >= 4500UL);
+          then:
+            - lambda: |-
+                float ring3_km = 10.0f;
+                const std::string range = id(flight_radar_range).current_option();
+                if (range.rfind("5", 0) == 0) ring3_km = 5.0f;
+                else if (range.rfind("15", 0) == 0) ring3_km = 15.0f;
+                else if (range.rfind("25", 0) == 0) ring3_km = 25.0f;
+
+                const float outer_km = ring3_km * (4.0f / 3.0f);
+                const float fetch_km = outer_km * (177.0f / 160.0f);
+                const float fetch_nm = fetch_km / 1.852f;
+
+                char url[180];
+                snprintf(url, sizeof(url),
+                         "https://opendata.adsb.fi/api/v3/lat/%.6f/lon/%.6f/dist/%.1f",
+                         id(ha_home_latitude).state,
+                         id(ha_home_longitude).state,
+                         fetch_nm);
+
+                if (!id(async_radar_http).start(std::string(url))) {
+                  id(flight_radar_status).publish_state("error");
+                  id(flight_radar_last_error).publish_state("async request rejected");
+                  id(flight_radar_breadcrumb).publish_state("request rejected");
+                  return;
+                }
+
+                id(flight_radar_fetch_in_progress) = true;
+                id(flight_radar_last_fetch_ms) = millis();
+                id(flight_radar_fetch_started_ms) = id(flight_radar_last_fetch_ms);
+                id(flight_radar_breadcrumb).publish_state("fetch queued");
+                id(flight_radar_status).publish_state("fetching");
+          else:
+            - lambda: |-
+                if (!id(ha_home_latitude).has_state()
+                    || !id(ha_home_longitude).has_state()) {
+                  id(flight_radar_status).publish_state("no home location");
+                }
+  - id: flight_detail_apply_cached
+    mode: restart
+    then:
+      - lambda: |-
+          id(flight_detail_route_key) = id(flight_detail_selected_callsign);
+          id(flight_detail_route_valid) = false;
+          id(flight_detail_airline) = "";
+          id(flight_detail_origin_city) = "";
+          id(flight_detail_origin_code) = "";
+          id(flight_detail_destination_city) = "";
+          id(flight_detail_destination_code) = "";
+
+          if (id(flight_detail_selected_callsign).empty()) {
+            id(flight_detail_route_status) = "unavailable";
+            return;
+          }
+          const auto *record = id(async_radar_http).find_enrichment(
+              id(flight_detail_selected_callsign));
+          if (record == nullptr
+              || record->status ==
+                     esphome::async_flight_radar::EnrichmentStatus::PENDING
+              || record->status ==
+                     esphome::async_flight_radar::EnrichmentStatus::RETRY) {
+            id(flight_detail_route_status) = "loading";
+            return;
+          }
+          if (record->status ==
+              esphome::async_flight_radar::EnrichmentStatus::UNAVAILABLE) {
+            id(flight_detail_route_status) = "unavailable";
+            return;
+          }
+
+          id(flight_detail_airline) = record->airline;
+          id(flight_detail_origin_city) = record->origin_city;
+          id(flight_detail_origin_code) = record->origin_code;
+          id(flight_detail_origin_lat) = record->origin_lat;
+          id(flight_detail_origin_lon) = record->origin_lon;
+          id(flight_detail_destination_city) = record->destination_city;
+          id(flight_detail_destination_code) = record->destination_code;
+          id(flight_detail_destination_lat) = record->destination_lat;
+          id(flight_detail_destination_lon) = record->destination_lon;
+          id(flight_detail_route_valid) = record->route_positions_valid;
+          id(flight_detail_route_status) = "ready";
+
+  - id: flight_detail_prefetch
+    mode: single
+    then:
+      - if:
+          condition:
+            wifi.connected:
+          then:
+            - lambda: |-
+                if (id(async_radar_http).is_enrichment_running()
+                    || id(async_radar_http).is_flight_times_running()) return;
+                if (!id(ha_home_latitude).has_state()
+                    || !id(ha_home_longitude).has_state()) return;
+
+                const std::string &payload = id(flight_radar_aircraft_payload);
+                const char *cursor = payload.c_str();
+                const char *end = cursor + payload.size();
+                std::string best_callsign;
+                std::string best_hex;
+                float best_distance_squared = INFINITY;
+
+                auto read_field = [&](std::string *destination) -> char {
+                  const char *start = cursor;
+                  while (cursor < end && *cursor != '|' && *cursor != ';') cursor++;
+                  destination->assign(start, cursor - start);
+                  const char delimiter = cursor < end ? *cursor : '\0';
+                  if (cursor < end) cursor++;
+                  return delimiter;
+                };
+                auto normalize = [](const std::string &input) -> std::string {
+                  std::string output;
+                  output.reserve(input.size());
+                  for (char character : input) {
+                    if (character >= 'a' && character <= 'z') character -= 'a' - 'A';
+                    if ((character >= 'A' && character <= 'Z')
+                        || (character >= '0' && character <= '9')) {
+                      output.push_back(character);
+                    }
+                  }
+                  return output;
+                };
+
+                while (cursor < end) {
+                  std::string fields[11];
+                  bool complete = true;
+                  for (int index = 0; index < 11; index++) {
+                    const char delimiter = read_field(&fields[index]);
+                    if (index < 10 && delimiter != '|') {
+                      complete = false;
+                      break;
+                    }
+                    if (index == 10 && delimiter != ';' && delimiter != '\0') {
+                      complete = false;
+                    }
+                  }
+                  if (!complete) {
+                    while (cursor < end && *cursor != ';') cursor++;
+                    if (cursor < end) cursor++;
+                    continue;
+                  }
+
+                  const std::string callsign = normalize(fields[5]);
+                  if (callsign.empty()
+                      || !id(async_radar_http).needs_enrichment(callsign)) {
+                    continue;
+                  }
+
+                  const float lat = strtof(fields[0].c_str(), nullptr);
+                  const float lon = strtof(fields[1].c_str(), nullptr);
+                  const float latitude_scale = cosf(
+                      id(ha_home_latitude).state * 0.01745329252f);
+                  const float dx = (lon - id(ha_home_longitude).state)
+                      * latitude_scale;
+                  const float dy = lat - id(ha_home_latitude).state;
+                  const float distance_squared = dx * dx + dy * dy;
+                  if (distance_squared < best_distance_squared) {
+                    best_distance_squared = distance_squared;
+                    best_callsign = callsign;
+                    best_hex = normalize(fields[8]);
+                  }
+                }
+                if (best_callsign.empty()) return;
+
+                bool valid_hex = best_hex.size() == 6;
+                for (const char character : best_hex) {
+                  if (!((character >= '0' && character <= '9')
+                        || (character >= 'A' && character <= 'F'))) {
+                    valid_hex = false;
+                  }
+                }
+
+                std::string url;
+                if (valid_hex) {
+                  url = "https://api.adsbdb.com/v0/aircraft/" + best_hex
+                      + "?callsign=" + best_callsign;
+                } else {
+                  url = "https://api.adsbdb.com/v0/callsign/" + best_callsign;
+                }
+                if (!id(async_radar_http).start_enrichment(
+                        url, best_callsign, best_hex)) return;
+
+                id(flight_detail_fetch_in_progress) = true;
+                char breadcrumb[64];
+                snprintf(breadcrumb, sizeof(breadcrumb), "prefetch %.15s queued",
+                         best_callsign.c_str());
+                id(flight_radar_breadcrumb).publish_state(breadcrumb);
+
+  - id: flight_times_fetch
+    mode: restart
+    then:
+      - lambda: |-
+          auto normalize = [](const std::string &input) -> std::string {
+            std::string output;
+            output.reserve(input.size());
+            for (char character : input) {
+              if (character >= 'a' && character <= 'z') character -= 'a' - 'A';
+              if ((character >= 'A' && character <= 'Z')
+                  || (character >= '0' && character <= '9')) {
+                output.push_back(character);
+              }
+            }
+            return output;
+          };
+          auto publish_status = [&](const char *status) {
+            id(flight_times_status) = status;
+            id(flight_times_status_sensor).publish_state(status);
+          };
+
+          if (!id(flight_detail_active)
+              || id(flight_detail_selected_callsign).empty()) {
+            publish_status("unavailable");
+            return;
+          }
+
+          const std::string callsign =
+              normalize(id(flight_detail_selected_callsign));
+          const std::string aircraft_hex =
+              normalize(id(flight_detail_selected_hex));
+          const std::string registration =
+              normalize(id(flight_detail_selected_registration));
+          const std::string request_key =
+              aircraft_hex.empty() ? callsign : aircraft_hex;
+          const uint32_t now_ms = millis();
+
+          if (id(flight_times_status) == "ready"
+              && id(flight_times_cache_key) == request_key
+              && now_ms - id(flight_times_cached_at_ms) < 60000UL) {
+            publish_status("ready");
+            return;
+          }
+
+          id(flight_times_cache_key) = "";
+          id(flight_times_actual_off_epoch) = 0;
+          id(flight_times_estimated_on_epoch) = 0;
+          id(flight_times_cached_at_ms) = 0;
+
+          if (!id(device_time).now().is_valid()) {
+            publish_status("clock_wait");
+            id(flight_radar_breadcrumb).publish_state("AeroAPI waiting for clock");
+            return;
+          }
+          if (id(async_radar_http).is_flight_times_running()) {
+            publish_status("busy");
+            id(flight_radar_breadcrumb).publish_state("AeroAPI request already running");
+            return;
+          }
+          if (id(flight_times_last_request_ms) != 0
+              && now_ms - id(flight_times_last_request_ms) < 7000UL) {
+            publish_status("rate_limited");
+            id(flight_radar_breadcrumb).publish_state("AeroAPI tap rate limited");
+            return;
+          }
+
+          const auto now = id(device_time).now();
+          time_t start_epoch = now.timestamp - 24 * 60 * 60;
+          time_t end_epoch = now.timestamp + 6 * 60 * 60;
+          struct tm start_tm {};
+          struct tm end_tm {};
+          gmtime_r(&start_epoch, &start_tm);
+          gmtime_r(&end_epoch, &end_tm);
+          char start_time[24];
+          char end_time[24];
+          strftime(start_time, sizeof(start_time), "%Y-%m-%dT%H:%M:%SZ", &start_tm);
+          strftime(end_time, sizeof(end_time), "%Y-%m-%dT%H:%M:%SZ", &end_tm);
+
+          char url[256];
+          snprintf(url, sizeof(url),
+                   "https://aeroapi.flightaware.com/aeroapi/flights/%s"
+                   "?start=%s&end=%s&max_pages=1",
+                   callsign.c_str(), start_time, end_time);
+          if (!id(async_radar_http).start_flight_times(
+                  std::string(url), callsign, aircraft_hex, registration)) {
+            publish_status("request_rejected");
+            id(flight_radar_breadcrumb).publish_state("AeroAPI request rejected");
+            return;
+          }
+
+          id(flight_times_last_request_ms) = now_ms;
+          publish_status("loading");
+          char breadcrumb[64];
+          snprintf(breadcrumb, sizeof(breadcrumb), "AeroAPI %.15s queued",
+                   callsign.c_str());
+          id(flight_radar_breadcrumb).publish_state(breadcrumb);
+
+  - id: pulse_touch_input
+    mode: restart
+    then:
+      - binary_sensor.template.publish:
+          id: touch_input
+          state: true
+      - delay: 150ms
+      - binary_sensor.template.publish:
+          id: touch_input
+          state: false
+
+  - id: pulse_swipe_left
+    mode: restart
+    then:
+      - binary_sensor.template.publish:
+          id: swipe_left
+          state: true
+      - delay: 150ms
+      - binary_sensor.template.publish:
+          id: swipe_left
+          state: false
+
+  - id: pulse_swipe_right
+    mode: restart
+    then:
+      - binary_sensor.template.publish:
+          id: swipe_right
+          state: true
+      - delay: 150ms
+      - binary_sensor.template.publish:
+          id: swipe_right
+          state: false
+
+  - id: pulse_swipe_up
+    mode: restart
+    then:
+      - binary_sensor.template.publish:
+          id: swipe_up
+          state: true
+      - delay: 150ms
+      - binary_sensor.template.publish:
+          id: swipe_up
+          state: false
+
+  - id: pulse_swipe_down
+    mode: restart
+    then:
+      - binary_sensor.template.publish:
+          id: swipe_down
+          state: true
+      - delay: 150ms
+      - binary_sensor.template.publish:
+          id: swipe_down
+          state: false
+
+i2c:
+  - id: bus_a
+    scl: GPIO1
+    sda: GPIO2
+    frequency: 100kHz
+    scan: true
+
+touchscreen:
+  - platform: cst816
+    id: screen_touch
+    interrupt_pin: GPIO10
+    display: main_display
+    i2c_id: bus_a
+    on_touch:
+      - lambda: |-
+          id(touch_active) = true;
+          id(touch_start_x) = touch.x;
+          id(touch_start_y) = touch.y;
+          id(touch_last_x) = touch.x;
+          id(touch_last_y) = touch.y;
+          id(touch_start_ms) = millis();
+          if (id(flight_detail_active)) {
+            id(flight_detail_last_interaction_ms) = millis();
+          }
+    on_update:
+      - lambda: |-
+          if (!id(touch_active)) return;
+          for (auto &point : touches) {
+            if (point.state >= 1 && point.state <= 2) {
+              id(touch_last_x) = point.x;
+              id(touch_last_y) = point.y;
+              break;
+            }
+          }
+    on_release:
+      - lambda: |-
+          if (!id(touch_active)) return;
+          id(touch_active) = false;
+
+          int dx = id(touch_last_x) - id(touch_start_x);
+          int dy = id(touch_last_y) - id(touch_start_y);
+          const uint32_t elapsed = millis() - id(touch_start_ms);
+          const int min_dim = std::min(id(main_display).get_width(), id(main_display).get_height());
+          const int swipe_distance = std::max(16, min_dim / 8);
+          const int tap_distance = std::max(14, min_dim / 12);
+
+          switch (${rotate_display}) {
+            case 90: {
+              const int old_dx = dx;
+              dx = dy;
+              dy = -old_dx;
+              break;
+            }
+            case 180:
+              dx = -dx;
+              dy = -dy;
+              break;
+            case 270: {
+              const int old_dx = dx;
+              dx = -dy;
+              dy = old_dx;
+              break;
+            }
+            default:
+              break;
+          }
+
+          const int abs_x = std::abs(dx);
+          const int abs_y = std::abs(dy);
+          if (elapsed <= 1500UL && (abs_x >= swipe_distance || abs_y >= swipe_distance)) {
+            if (abs_x >= abs_y) {
+              if (dx < 0) id(pulse_swipe_left).execute();
+              else id(pulse_swipe_right).execute();
+            } else {
+              if (dy < 0) id(pulse_swipe_up).execute();
+              else id(pulse_swipe_down).execute();
+            }
+          } else if (elapsed <= 700UL && abs_x <= tap_distance && abs_y <= tap_distance) {
+            id(pulse_touch_input).execute();
+
+            if (id(flight_detail_active)) {
+              id(flight_detail_active) = false;
+              id(flight_radar_hit_count) = 0;
+              return;
+            }
+
+            const int tap_x = id(touch_last_x);
+            const int tap_y = id(touch_last_y);
+            const int hit_radius = 28;
+            int best_hit = -1;
+            int best_label_distance_squared = 0x7FFFFFFF;
+            constexpr int LABEL_TOUCH_PADDING = 4;
+            for (int index = 0; index < id(flight_radar_hit_count); index++) {
+              const int raw_x0 = id(flight_radar_hit_label_x0)[index];
+              const int raw_y0 = id(flight_radar_hit_label_y0)[index];
+              const int raw_x1 = id(flight_radar_hit_label_x1)[index];
+              const int raw_y1 = id(flight_radar_hit_label_y1)[index];
+              if (raw_x1 <= raw_x0 || raw_y1 <= raw_y0) continue;
+              const int x0 = raw_x0 - LABEL_TOUCH_PADDING;
+              const int y0 = raw_y0 - LABEL_TOUCH_PADDING;
+              const int x1 = raw_x1 + LABEL_TOUCH_PADDING;
+              const int y1 = raw_y1 + LABEL_TOUCH_PADDING;
+              if (tap_x < x0 || tap_x >= x1
+                  || tap_y < y0 || tap_y >= y1) {
+                continue;
+              }
+              const int center_dx = tap_x - (x0 + x1) / 2;
+              const int center_dy = tap_y - (y0 + y1) / 2;
+              const int distance_squared =
+                  center_dx * center_dx + center_dy * center_dy;
+              if (distance_squared < best_label_distance_squared) {
+                best_hit = index;
+                best_label_distance_squared = distance_squared;
+              }
+            }
+
+            if (best_hit < 0) {
+              int best_plane_distance_squared = hit_radius * hit_radius + 1;
+              for (int index = 0; index < id(flight_radar_hit_count); index++) {
+                const int hit_dx = tap_x - id(flight_radar_hit_x)[index];
+                const int hit_dy = tap_y - id(flight_radar_hit_y)[index];
+                const int distance_squared = hit_dx * hit_dx + hit_dy * hit_dy;
+                if (distance_squared < best_plane_distance_squared) {
+                  best_hit = index;
+                  best_plane_distance_squared = distance_squared;
+                }
+              }
+            }
+            if (best_hit < 0) return;
+            if (id(flight_radar_hit_generation)
+                != id(flight_radar_payload_generation)) return;
+
+            const int target_plane =
+                id(flight_radar_hit_plane_index)[best_hit];
+            const std::string &payload = id(flight_radar_aircraft_payload);
+            const char *cursor = payload.c_str();
+            const char *end = cursor + payload.size();
+            for (int index = 0; index < target_plane && cursor < end; index++) {
+              while (cursor < end && *cursor != ';') cursor++;
+              if (cursor < end) cursor++;
+            }
+            if (cursor >= end) return;
+
+            auto read_field = [&]() -> std::string {
+              const char *start = cursor;
+              while (cursor < end && *cursor != '|' && *cursor != ';') cursor++;
+              std::string value(start, cursor - start);
+              if (cursor < end) cursor++;
+              return value;
+            };
+
+            const std::string latitude = read_field();
+            const std::string longitude = read_field();
+            read_field();
+            read_field();
+            const std::string ground_speed = read_field();
+            const std::string callsign = read_field();
+            const std::string type = read_field();
+            const std::string altitude = read_field();
+            const std::string hex = read_field();
+            const std::string description = read_field();
+            const std::string registration = read_field();
+            if (hex.empty()) return;
+
+            id(flight_detail_selected_lat) = strtof(latitude.c_str(), nullptr);
+            id(flight_detail_selected_lon) = strtof(longitude.c_str(), nullptr);
+            id(flight_detail_selected_ground_speed) =
+                strtof(ground_speed.c_str(), nullptr);
+            id(flight_detail_selected_callsign) = callsign;
+            id(flight_detail_selected_type) = type;
+            id(flight_detail_selected_altitude) = altitude;
+            id(flight_detail_selected_hex) = hex;
+            id(flight_detail_selected_description) = description;
+            id(flight_detail_selected_registration) = registration;
+            id(flight_detail_active) = true;
+            id(flight_detail_last_interaction_ms) = millis();
+            id(flight_radar_hit_count) = 0;
+            id(flight_detail_apply_cached).execute();
+            id(flight_detail_prefetch).execute();
+            id(flight_times_fetch).execute();
+          }
+
+esp32_touch:
+  setup_mode: false
+  measurement_duration: 0.25ms
+  sleep_duration: 0.5ms
+
+spi:
+  id: display_qspi
+  type: quad
+  clk_pin: GPIO18
+  data_pins: [GPIO46, GPIO13, GPIO11, GPIO12]
+
+display:
+  - platform: mipi_spi
+    id: main_display
+    model: JC3636W518V2
+    cs_pin: GPIO14
+    reset_pin: GPIO3
+    data_rate: 40MHz
+    color_order: rgb
+    rotation: ${rotate_display}
+    update_interval: 100ms
+    auto_clear_enabled: false
+    dimensions:
+      height: ${imageheight}
+      width: ${imagewidth}
+    pages:
+      - id: flight_radar_page
+        lambda: |-
+          const int W = it.get_width();
+          const int H = it.get_height();
+          const int MIN_WH = std::min(W, H);
+          const int CX = W / 2;
+          const int CY = H / 2;
+          const int R = MIN_WH / 2 - 20;
+          const int EDGE_R = MIN_WH / 2 - 3;
+
+          const Color BG(4, 10, 28);
+          const Color GRID(16, 100, 32);
+          const Color LABEL(255, 255, 255);
+          const Color AIRCRAFT(255, 210, 32);
+          const Color TRACK(255, 0, 255);
+          const Color TYPE_COLOR(255, 200, 0);
+          const Color ALTITUDE_COLOR(90, 200, 255);
+          const Color RUNWAY(56, 150, 170);
+          const Color RUNWAY_LABEL(110, 210, 230);
+
+          const uint32_t frame_start_ms = millis();
+          id(flight_radar_frame_started_ms) = frame_start_ms;
+          struct RadarDirtyRect {
+            int x0;
+            int y0;
+            int x1;
+            int y1;
+          };
+          static RadarDirtyRect previous_dirty[96];
+          static int previous_dirty_count = 0;
+          static bool radar_base_initialized = false;
+          static bool radar_last_show_map = false;
+          static bool radar_last_has_home = false;
+          static bool radar_last_show_runways = false;
+          static std::string radar_last_range;
+          const bool publish_frame_diag =
+              id(flight_radar_frame_last_diag_ms) == 0
+              || frame_start_ms - id(flight_radar_frame_last_diag_ms) >= 10000UL;
+          if (publish_frame_diag) {
+            id(flight_radar_breadcrumb).publish_state("draw start");
+          }
+
+          if (id(flight_detail_active)
+              && frame_start_ms - id(flight_detail_last_interaction_ms)
+                     >= 60000UL) {
+            id(flight_detail_active) = false;
+            id(flight_radar_hit_count) = 0;
+          }
+
+          if (id(flight_detail_active)) {
+            it.fill(BG);
+            radar_base_initialized = false;
+            previous_dirty_count = 0;
+            id(flight_radar_hit_count) = 0;
+
+            const Color MUTED(90, 150, 165);
+            const Color ACCENT(90, 220, 255);
+            const Color ROUTE(80, 220, 130);
+            const Color DIVIDER(20, 85, 70);
+
+            const std::string display_callsign =
+                id(flight_detail_selected_callsign).empty()
+                    ? id(flight_detail_selected_hex)
+                    : id(flight_detail_selected_callsign);
+            it.printf(CX, 10, id(font_radar_large), AIRCRAFT,
+                      TextAlign::TOP_CENTER, "%s", display_callsign.c_str());
+
+            std::string airline = id(flight_detail_airline);
+            if (id(flight_detail_route_status) == "loading") {
+              airline = "LOOKING UP FLIGHT";
+            } else if (airline.empty()) {
+              airline = "AIRLINE UNAVAILABLE";
+            }
+            it.printf(CX, 39, id(font_radar_small), ACCENT,
+                      TextAlign::TOP_CENTER, "%s", airline.c_str());
+            it.line(48, 63, W - 48, 63, DIVIDER);
+
+            if (id(flight_detail_route_status) == "ready") {
+              std::string origin = id(flight_detail_origin_city);
+              std::string destination = id(flight_detail_destination_city);
+              if (!id(flight_detail_origin_code).empty()) {
+                origin += "  " + id(flight_detail_origin_code);
+              }
+              if (!id(flight_detail_destination_code).empty()) {
+                destination += "  " + id(flight_detail_destination_code);
+              }
+              it.printf(CX, 73, id(font_detail_value), LABEL,
+                        TextAlign::TOP_CENTER, "%s", origin.c_str());
+              it.printf(CX, 100, id(font_radar_small), ROUTE,
+                        TextAlign::TOP_CENTER, "TO");
+              it.printf(CX, 119, id(font_detail_value), LABEL,
+                        TextAlign::TOP_CENTER, "%s", destination.c_str());
+            } else if (id(flight_detail_route_status) == "loading") {
+              it.printf(CX, 94, id(font_detail_value), MUTED,
+                        TextAlign::TOP_CENTER, "ROUTE LOADING");
+            } else {
+              it.printf(CX, 94, id(font_detail_value), MUTED,
+                        TextAlign::TOP_CENTER, "ROUTE UNAVAILABLE");
+            }
+            it.line(35, 151, W - 35, 151, DIVIDER);
+
+            char departed[24] = "--:--";
+            char arriving[24] = "--:--";
+            bool has_estimate = false;
+            bool has_api_times = false;
+
+            auto normalize_key = [](const std::string &input) -> std::string {
+              std::string output;
+              output.reserve(input.size());
+              for (char character : input) {
+                if (character >= 'a' && character <= 'z') character -= 'a' - 'A';
+                if ((character >= 'A' && character <= 'Z')
+                    || (character >= '0' && character <= '9')) {
+                  output.push_back(character);
+                }
+              }
+              return output;
+            };
+            const std::string selected_times_key =
+                id(flight_detail_selected_hex).empty()
+                    ? normalize_key(id(flight_detail_selected_callsign))
+                    : normalize_key(id(flight_detail_selected_hex));
+            const auto current_time = id(device_time).now();
+            if (id(flight_times_status) == "ready"
+                && id(flight_times_cache_key) == selected_times_key
+                && id(flight_times_actual_off_epoch) > 0
+                && id(flight_times_estimated_on_epoch) > 0
+                && current_time.is_valid()) {
+              auto format_api_duration = [](int64_t seconds, const char *suffix,
+                                            char *output, size_t output_length) {
+                const int64_t nonnegative_seconds = std::max<int64_t>(0, seconds);
+                int total_minutes = static_cast<int>((nonnegative_seconds + 30) / 60);
+                total_minutes = std::min(total_minutes, 99 * 60 + 59);
+                snprintf(output, output_length, "%02d:%02d%s",
+                         total_minutes / 60, total_minutes % 60, suffix);
+              };
+              const int64_t now_epoch = static_cast<int64_t>(current_time.timestamp);
+              format_api_duration(
+                  now_epoch - id(flight_times_actual_off_epoch), " AGO",
+                  departed, sizeof(departed));
+              format_api_duration(
+                  id(flight_times_estimated_on_epoch) - now_epoch, "",
+                  arriving, sizeof(arriving));
+              has_api_times = true;
+            }
+
+            if (!has_api_times && id(flight_detail_route_valid)
+                && id(flight_detail_selected_ground_speed) >= 60.0f) {
+              constexpr float DEG_TO_RAD_DETAIL = 0.01745329252f;
+              constexpr float EARTH_RADIUS_NM = 3440.065f;
+              auto distance_nm = [&](float lat1, float lon1,
+                                     float lat2, float lon2) -> float {
+                const float dlat = (lat2 - lat1) * DEG_TO_RAD_DETAIL;
+                const float dlon = (lon2 - lon1) * DEG_TO_RAD_DETAIL;
+                const float lat1_rad = lat1 * DEG_TO_RAD_DETAIL;
+                const float lat2_rad = lat2 * DEG_TO_RAD_DETAIL;
+                const float a = sinf(dlat * 0.5f) * sinf(dlat * 0.5f)
+                    + cosf(lat1_rad) * cosf(lat2_rad)
+                        * sinf(dlon * 0.5f) * sinf(dlon * 0.5f);
+                return EARTH_RADIUS_NM
+                    * 2.0f * atan2f(sqrtf(a), sqrtf(std::max(0.0f, 1.0f - a)));
+              };
+              auto format_duration = [](float minutes, const char *suffix,
+                                        char *output, size_t output_length) {
+                int total_minutes = (int) lroundf(std::max(0.0f, minutes));
+                total_minutes = std::min(total_minutes, 99 * 60 + 59);
+                snprintf(output, output_length, "~%02d:%02d%s",
+                         total_minutes / 60, total_minutes % 60, suffix);
+              };
+
+              const float speed = id(flight_detail_selected_ground_speed);
+              const float travelled_nm = distance_nm(
+                  id(flight_detail_origin_lat), id(flight_detail_origin_lon),
+                  id(flight_detail_selected_lat), id(flight_detail_selected_lon));
+              const float remaining_nm = distance_nm(
+                  id(flight_detail_selected_lat), id(flight_detail_selected_lon),
+                  id(flight_detail_destination_lat),
+                  id(flight_detail_destination_lon));
+              format_duration(travelled_nm * 60.0f / speed, " AGO",
+                              departed, sizeof(departed));
+              format_duration(remaining_nm * 60.0f / speed, "",
+                              arriving, sizeof(arriving));
+              has_estimate = true;
+            }
+
+            it.printf(88, 160, id(font_radar_small), MUTED,
+                      TextAlign::TOP_CENTER, "DEPARTED");
+            it.printf(W - 88, 160, id(font_radar_small), MUTED,
+                      TextAlign::TOP_CENTER, "ARRIVING IN");
+            it.printf(88, 180, id(font_detail_value), ROUTE,
+                      TextAlign::TOP_CENTER, "%s", departed);
+            it.printf(W - 88, 180, id(font_detail_value), ROUTE,
+                      TextAlign::TOP_CENTER, "%s", arriving);
+            it.line(35, 207, W - 35, 207, DIVIDER);
+
+            std::string aircraft_type = id(flight_detail_selected_type);
+            if (aircraft_type.empty()) aircraft_type = "UNKNOWN";
+            it.printf(CX, 215, id(font_radar_small), MUTED,
+                      TextAlign::TOP_CENTER, "AIRCRAFT");
+            it.printf(CX, 233, id(font_detail_value), TYPE_COLOR,
+                      TextAlign::TOP_CENTER, "%s", aircraft_type.c_str());
+            if (!id(flight_detail_selected_description).empty()) {
+              it.printf(CX, 256, id(font_radar_small), LABEL,
+                        TextAlign::TOP_CENTER, "%s",
+                        id(flight_detail_selected_description).c_str());
+            }
+
+            std::string altitude = id(flight_detail_selected_altitude);
+            if (altitude.empty()) altitude = "--";
+            char speed[16] = "--";
+            if (id(flight_detail_selected_ground_speed) > 0.0f) {
+              snprintf(speed, sizeof(speed), "%d kt",
+                       (int) lroundf(id(flight_detail_selected_ground_speed)));
+            }
+            it.printf(90, 283, id(font_radar_small), MUTED,
+                      TextAlign::TOP_CENTER, "ALTITUDE");
+            it.printf(W - 90, 283, id(font_radar_small), MUTED,
+                      TextAlign::TOP_CENTER, "SPEED");
+            it.printf(90, 303, id(font_detail_value), ALTITUDE_COLOR,
+                      TextAlign::TOP_CENTER, "%s", altitude.c_str());
+            it.printf(W - 90, 303, id(font_detail_value), ALTITUDE_COLOR,
+                      TextAlign::TOP_CENTER, "%s", speed);
+            if (has_estimate) {
+              it.printf(CX, H - 9, id(font_radar_small), MUTED,
+                        TextAlign::BOTTOM_CENTER, "ESTIMATED");
+            }
+
+            id(flight_radar_frame_duration_ms) = millis() - frame_start_ms;
+            if (id(flight_radar_frame_duration_ms)
+                > id(flight_radar_frame_max_duration_ms)) {
+              id(flight_radar_frame_max_duration_ms) =
+                  id(flight_radar_frame_duration_ms);
+            }
+            id(flight_radar_frame_planes) = 0;
+            id(flight_radar_frame_labels) = 0;
+            id(flight_radar_frame_degraded_labels) = 0;
+            id(flight_radar_frame_skipped_labels) = 0;
+            if (publish_frame_diag) {
+              id(flight_radar_frame_last_diag_ms) = millis();
+              id(flight_radar_display_duration_ms_sensor).publish_state(
+                  id(flight_radar_frame_duration_ms));
+              char breadcrumb[64];
+              snprintf(breadcrumb, sizeof(breadcrumb),
+                       "detail draw ok %ums %s",
+                       (unsigned) id(flight_radar_frame_duration_ms),
+                       id(flight_detail_route_status).c_str());
+              id(flight_radar_breadcrumb).publish_state(breadcrumb);
+            }
+            return;
+          }
+
+          id(flight_radar_hit_count) = 0;
+          float ring3_km = 10.0f;
+          const std::string range = id(flight_radar_range).current_option();
+          if (range.rfind("5", 0) == 0) ring3_km = 5.0f;
+          else if (range.rfind("15", 0) == 0) ring3_km = 15.0f;
+          else if (range.rfind("25", 0) == 0) ring3_km = 25.0f;
+          const float outer_km = ring3_km * (4.0f / 3.0f);
+          const float fetch_km = outer_km * ((float) EDGE_R / (float) R);
+          const float px_per_km = (float) R / outer_km;
+
+          const bool has_home = id(ha_home_latitude).has_state()
+              && id(ha_home_longitude).has_state();
+          const float home_lat = has_home ? id(ha_home_latitude).state : 0.0f;
+          const float home_lon = has_home ? id(ha_home_longitude).state : 0.0f;
+          constexpr float MAP_HOME_LAT = ${map_center_latitude}f;
+          constexpr float MAP_HOME_LON = ${map_center_longitude}f;
+          const bool show_map = has_home
+              && range.rfind("10", 0) == 0
+              && fabsf(home_lat - MAP_HOME_LAT) < 0.002f
+              && fabsf(home_lon - MAP_HOME_LON) < 0.002f;
+          const bool show_runways = id(flight_radar_show_runways).state;
+
+          RadarDirtyRect next_dirty[96];
+          int next_dirty_count = 0;
+          auto mark_dirty = [&](int x0, int y0, int x1, int y1) {
+            x0 = std::max(0, std::min(W, x0));
+            y0 = std::max(0, std::min(H, y0));
+            x1 = std::max(0, std::min(W, x1));
+            y1 = std::max(0, std::min(H, y1));
+            if (x1 <= x0 || y1 <= y0) return;
+
+            for (int index = 0; index < next_dirty_count; index++) {
+              RadarDirtyRect &existing = next_dirty[index];
+              if (x1 + 2 < existing.x0 || existing.x1 + 2 < x0
+                  || y1 + 2 < existing.y0 || existing.y1 + 2 < y0) {
+                continue;
+              }
+              existing.x0 = std::min(existing.x0, x0);
+              existing.y0 = std::min(existing.y0, y0);
+              existing.x1 = std::max(existing.x1, x1);
+              existing.y1 = std::max(existing.y1, y1);
+              return;
+            }
+            if (next_dirty_count < 96) {
+              next_dirty[next_dirty_count++] = {x0, y0, x1, y1};
+            }
+          };
+          auto commit_dirty = [&]() {
+            previous_dirty_count = next_dirty_count;
+            for (int index = 0; index < next_dirty_count; index++) {
+              previous_dirty[index] = next_dirty[index];
+            }
+          };
+
+          const bool rebuild_radar_base = !radar_base_initialized
+              || radar_last_show_map != show_map
+              || radar_last_has_home != has_home
+              || radar_last_show_runways != show_runways
+              || radar_last_range != range;
+          if (rebuild_radar_base) {
+            it.fill(BG);
+            if (show_map) it.image(0, 0, id(flight_radar_map_10km));
+            previous_dirty_count = 0;
+            radar_base_initialized = true;
+            radar_last_show_map = show_map;
+            radar_last_has_home = has_home;
+            radar_last_show_runways = show_runways;
+            radar_last_range = range;
+          } else {
+            for (int index = 0; index < previous_dirty_count; index++) {
+              const RadarDirtyRect &rectangle = previous_dirty[index];
+              if (!show_map) {
+                it.filled_rectangle(rectangle.x0, rectangle.y0,
+                                    rectangle.x1 - rectangle.x0,
+                                    rectangle.y1 - rectangle.y0, BG);
+                continue;
+              }
+              for (int y = rectangle.y0; y < rectangle.y1; y++) {
+                for (int x = rectangle.x0; x < rectangle.x1; x++) {
+                  it.draw_pixel_at(x, y,
+                                   id(flight_radar_map_10km).get_pixel(x, y));
+                }
+              }
+            }
+          }
+
+          char scale_label[20];
+          if (id(flight_radar_units).current_option() == "mi") {
+            snprintf(scale_label, sizeof(scale_label), "%dmi",
+                     (int) lroundf(ring3_km / 1.609344f));
+          } else {
+            snprintf(scale_label, sizeof(scale_label), "%dkm",
+                     (int) lroundf(ring3_km));
+          }
+
+          for (int ring = 1; ring <= 4; ring++) {
+            const int radius = (R * ring) / 4;
+            it.circle(CX, CY, radius, GRID);
+            it.circle(CX, CY, radius - 1, GRID);
+          }
+          it.line(CX, CY - R, CX, CY + R, GRID);
+          it.line(CX - R, CY, CX + R, CY, GRID);
+          it.filled_circle(CX, CY, 3, LABEL);
+
+          it.printf(CX, 3, id(font_radar_small), LABEL, TextAlign::TOP_CENTER, "N");
+          it.printf(CX, H - 3, id(font_radar_small), LABEL, TextAlign::BOTTOM_CENTER, "S");
+          it.printf(3, CY, id(font_radar_small), LABEL, TextAlign::CENTER_LEFT, "W");
+          it.printf(W - 3, CY, id(font_radar_small), LABEL, TextAlign::CENTER_RIGHT, "E");
+          it.filled_rectangle(CX + R - 45, CY - 10, 39, 20, BG);
+          it.printf(CX + R - 9, CY, id(font_radar_small), GRID,
+                    TextAlign::CENTER_RIGHT, "%s", scale_label);
+
+          if (!has_home) {
+            it.printf(CX, CY - 12, id(font_radar_large), LABEL,
+                      TextAlign::CENTER, "NO HOME");
+            it.printf(CX, CY + 16, id(font_radar_small), LABEL,
+                      TextAlign::CENTER, "zone.home unavailable");
+            mark_dirty(CX - 125, CY - 40, CX + 125, CY + 42);
+            commit_dirty();
+            return;
+          }
+
+          const float DEG_TO_RAD = 0.01745329252f;
+          const float KM_PER_DEG_LAT = 110.574f;
+          const float KM_PER_DEG_LON =
+              std::max(1.0f, 111.320f * cosf(home_lat * DEG_TO_RAD));
+
+          auto offset_km = [&](float lat, float lon, float &dx, float &dy,
+                               float &distance) {
+            dx = (lon - home_lon) * KM_PER_DEG_LON;
+            dy = (lat - home_lat) * KM_PER_DEG_LAT;
+            distance = sqrtf(dx * dx + dy * dy);
+          };
+
+          auto project = [&](float lat, float lon, int &x, int &y,
+                             float &distance) {
+            float dx = 0.0f;
+            float dy = 0.0f;
+            offset_km(lat, lon, dx, dy, distance);
+            x = CX + (int) lroundf(dx * px_per_km);
+            y = CY - (int) lroundf(dy * px_per_km);
+          };
+
+          auto thick_line = [&](int x0, int y0, int x1, int y1, Color color) {
+            it.line(x0, y0, x1, y1, color);
+            if (abs(x1 - x0) > abs(y1 - y0)) {
+              it.line(x0, y0 + 1, x1, y1 + 1, color);
+            } else {
+              it.line(x0 + 1, y0, x1 + 1, y1, color);
+            }
+          };
+
+          struct RunwayDef {
+            const char *ident;
+            float airport_lat;
+            float airport_lon;
+            float low_end_lat;
+            float low_end_lon;
+            float high_end_lat;
+            float high_end_lon;
+          };
+
+          static const RunwayDef RUNWAYS[] = {
+            {"EGLL", 51.470020f, -0.454295f, 51.477490f, -0.489439f,
+             51.477681f, -0.433227f},
+            {"EGLL", 51.470020f, -0.454295f, 51.464780f, -0.486808f,
+             51.464957f, -0.434048f},
+          };
+
+          int visible_runways = 0;
+          if (show_runways) {
+            const int runway_count = sizeof(RUNWAYS) / sizeof(RUNWAYS[0]);
+            const char *last_label = "";
+            for (int index = 0; index < runway_count; index++) {
+              float airport_dx = 0.0f;
+              float airport_dy = 0.0f;
+              float airport_distance = 0.0f;
+              offset_km(RUNWAYS[index].airport_lat,
+                        RUNWAYS[index].airport_lon,
+                        airport_dx, airport_dy, airport_distance);
+              if (airport_distance > fetch_km) continue;
+
+              int x0 = 0;
+              int y0 = 0;
+              int x1 = 0;
+              int y1 = 0;
+              float distance0 = 0.0f;
+              float distance1 = 0.0f;
+              project(RUNWAYS[index].low_end_lat,
+                      RUNWAYS[index].low_end_lon,
+                      x0, y0, distance0);
+              project(RUNWAYS[index].high_end_lat,
+                      RUNWAYS[index].high_end_lon,
+                      x1, y1, distance1);
+              thick_line(x0, y0, x1, y1, RUNWAY);
+              visible_runways++;
+
+              if (strcmp(last_label, RUNWAYS[index].ident) != 0) {
+                int label_x = 0;
+                int label_y = 0;
+                float label_distance = 0.0f;
+                project(RUNWAYS[index].airport_lat,
+                        RUNWAYS[index].airport_lon,
+                        label_x, label_y, label_distance);
+                if (label_distance > outer_km) {
+                  const float scale =
+                      (float) R / std::max(0.1f, label_distance * px_per_km);
+                  label_x = CX + (int) lroundf((label_x - CX) * scale);
+                  label_y = CY + (int) lroundf((label_y - CY) * scale);
+                }
+                it.filled_rectangle(label_x - 20, label_y - 19, 40, 17, BG);
+                it.printf(label_x, label_y - 2, id(font_radar_small),
+                          RUNWAY_LABEL, TextAlign::BOTTOM_CENTER, "%s",
+                          RUNWAYS[index].ident);
+                last_label = RUNWAYS[index].ident;
+              }
+            }
+          }
+          if (visible_runways != id(flight_radar_last_runway_count)) {
+            id(flight_radar_last_runway_count) = visible_runways;
+            id(flight_radar_runway_count).publish_state(visible_runways);
+          }
+
+          struct Plane {
+            float lat;
+            float lon;
+            float predicted_lat;
+            float predicted_lon;
+            float nose;
+            float track;
+            float ground_speed;
+            char callsign[12];
+            char type[8];
+            char altitude[18];
+            char hex[10];
+            char description[36];
+            char registration[16];
+          };
+
+          static Plane planes[48];
+          int plane_count = 0;
+          const bool has_data = id(flight_radar_last_success_ms) != 0;
+          const uint32_t age_ms =
+              has_data ? millis() - id(flight_radar_last_success_ms) : 0UL;
+          const uint32_t age_seconds = age_ms / 1000UL;
+          const float prediction_seconds =
+              has_data ? std::min(30.0f, (float) age_ms / 1000.0f) : 0.0f;
+
+          const std::string &payload = id(flight_radar_aircraft_payload);
+          const char *cursor = payload.c_str();
+          const char *end = cursor + payload.size();
+
+          auto read_field = [&](char *destination, size_t destination_length) -> char {
+            size_t length = 0;
+            while (cursor < end && *cursor != '|' && *cursor != ';') {
+              if (length + 1 < destination_length) {
+                destination[length++] = *cursor;
+              }
+              cursor++;
+            }
+            if (destination_length > 0) destination[length] = '\0';
+            const char delimiter = cursor < end ? *cursor : '\0';
+            if (cursor < end) cursor++;
+            return delimiter;
+          };
+
+          auto skip_record = [&]() {
+            while (cursor < end && *cursor != ';') cursor++;
+            if (cursor < end) cursor++;
+          };
+
+          while (cursor < end && plane_count < 48) {
+            char field[32];
+            Plane &plane = planes[plane_count];
+
+            char delimiter = read_field(field, sizeof(field));
+            if (field[0] == '\0' && delimiter == '\0') break;
+            if (delimiter != '|') {
+              if (delimiter == '\0') break;
+              continue;
+            }
+            plane.lat = strtof(field, nullptr);
+
+            delimiter = read_field(field, sizeof(field));
+            if (delimiter != '|') {
+              if (delimiter == '\0') break;
+              continue;
+            }
+            plane.lon = strtof(field, nullptr);
+
+            delimiter = read_field(field, sizeof(field));
+            if (delimiter != '|') {
+              if (delimiter == '\0') break;
+              continue;
+            }
+            plane.nose = strtof(field, nullptr);
+
+            delimiter = read_field(field, sizeof(field));
+            if (delimiter != '|') {
+              if (delimiter == '\0') break;
+              continue;
+            }
+            plane.track = strtof(field, nullptr);
+
+            delimiter = read_field(field, sizeof(field));
+            if (delimiter != '|') {
+              if (delimiter == '\0') break;
+              continue;
+            }
+            plane.ground_speed = strtof(field, nullptr);
+
+            delimiter = read_field(plane.callsign, sizeof(plane.callsign));
+            if (delimiter != '|') {
+              if (delimiter == '\0') break;
+              continue;
+            }
+
+            delimiter = read_field(plane.type, sizeof(plane.type));
+            if (delimiter != '|') {
+              if (delimiter == '\0') break;
+              continue;
+            }
+
+            delimiter = read_field(plane.altitude, sizeof(plane.altitude));
+            if (delimiter != '|') {
+              if (delimiter == '\0') break;
+              continue;
+            }
+
+            delimiter = read_field(plane.hex, sizeof(plane.hex));
+            if (delimiter != '|') {
+              if (delimiter == '\0') break;
+              continue;
+            }
+
+            delimiter = read_field(plane.description, sizeof(plane.description));
+            if (delimiter != '|') {
+              if (delimiter == '\0') break;
+              continue;
+            }
+
+            delimiter = read_field(plane.registration, sizeof(plane.registration));
+            if (delimiter != ';' && delimiter != '\0') skip_record();
+            if (plane.callsign[0] == '\0') {
+              strncpy(plane.callsign, plane.hex, sizeof(plane.callsign) - 1);
+              plane.callsign[sizeof(plane.callsign) - 1] = '\0';
+            }
+
+            plane.predicted_lat = plane.lat;
+            plane.predicted_lon = plane.lon;
+            if (plane.ground_speed > 0.0f && prediction_seconds > 0.0f) {
+              const float movement_km =
+                  plane.ground_speed * 1.852f * (prediction_seconds / 3600.0f);
+              const float track_radians = plane.track * DEG_TO_RAD;
+              plane.predicted_lat +=
+                  (cosf(track_radians) * movement_km) / KM_PER_DEG_LAT;
+              plane.predicted_lon +=
+                  (sinf(track_radians) * movement_km) / KM_PER_DEG_LON;
+            }
+            plane_count++;
+          }
+
+          if (!has_data) {
+            it.printf(CX, CY - 12, id(font_radar_large), LABEL,
+                      TextAlign::CENTER, "NO DATA");
+            std::string status = id(flight_radar_status).state.c_str();
+            if (status.empty()) status = "waiting for ADS-B";
+            it.printf(CX, CY + 16, id(font_radar_small), LABEL,
+                      TextAlign::CENTER, "%s", status.c_str());
+            mark_dirty(CX - 125, CY - 40, CX + 125, CY + 42);
+            commit_dirty();
+            return;
+          }
+          if (age_seconds > 15) {
+            it.printf(CX, CY - 12, id(font_radar_large), LABEL,
+                      TextAlign::CENTER, "STALE");
+            it.printf(CX, CY + 16, id(font_radar_small), LABEL,
+                      TextAlign::CENTER, "%lus old",
+                      (unsigned long) age_seconds);
+            mark_dirty(CX - 100, CY - 38, CX + 100, CY + 40);
+          }
+
+          struct DrawItem {
+            int index;
+            int x;
+            int y;
+            int distance_squared;
+          };
+          static DrawItem items[48];
+          static DrawItem dots[48];
+          int item_count = 0;
+          int dot_count = 0;
+
+          const int ICON_SIZE = 30;
+          const int ICON_RADIUS = ICON_SIZE / 2;
+          const int NOSE = ICON_RADIUS;
+          const int INSET = ICON_RADIUS + 2;
+          const float INNER_MAX_KM =
+              outer_km * ((float) (R - INSET) / (float) R);
+
+          auto distance_squared_px = [&](int x, int y) {
+            const int dx = x - CX;
+            const int dy = y - CY;
+            return dx * dx + dy * dy;
+          };
+
+          for (int index = 0; index < plane_count; index++) {
+            float dx = 0.0f;
+            float dy = 0.0f;
+            float distance = 0.0f;
+            offset_km(planes[index].predicted_lat,
+                      planes[index].predicted_lon,
+                      dx, dy, distance);
+            if (distance <= INNER_MAX_KM) {
+              int x = 0;
+              int y = 0;
+              float unused_distance = 0.0f;
+              project(planes[index].predicted_lat,
+                      planes[index].predicted_lon,
+                      x, y, unused_distance);
+              items[item_count++] =
+                  {index, x, y, distance_squared_px(x, y)};
+            } else if (distance > 0.01f) {
+              const float angle = atan2f(dx, dy);
+              const int x = CX + (int) lroundf(sinf(angle) * EDGE_R);
+              const int y = CY - (int) lroundf(cosf(angle) * EDGE_R);
+              dots[dot_count++] =
+                  {index, x, y, distance_squared_px(x, y)};
+            }
+          }
+
+          auto sort_far_first = [](DrawItem *array, int count) {
+            for (int index = 1; index < count; index++) {
+              const DrawItem key = array[index];
+              int position = index;
+              while (position > 0
+                     && array[position - 1].distance_squared
+                            < key.distance_squared) {
+                array[position] = array[position - 1];
+                position--;
+              }
+              array[position] = key;
+            }
+          };
+          sort_far_first(dots, dot_count);
+          sort_far_first(items, item_count);
+
+          id(flight_radar_hit_count) = item_count;
+          id(flight_radar_hit_generation) = id(flight_radar_payload_generation);
+          for (int index = 0; index < item_count; index++) {
+            id(flight_radar_hit_x)[index] = items[index].x;
+            id(flight_radar_hit_y)[index] = items[index].y;
+            id(flight_radar_hit_label_x0)[index] = -1;
+            id(flight_radar_hit_label_y0)[index] = -1;
+            id(flight_radar_hit_label_x1)[index] = -1;
+            id(flight_radar_hit_label_y1)[index] = -1;
+            id(flight_radar_hit_plane_index)[index] = items[index].index;
+          }
+
+          for (int index = 0; index < dot_count; index++) {
+            it.filled_circle(dots[index].x, dots[index].y, 5, AIRCRAFT);
+            mark_dirty(dots[index].x - 7, dots[index].y - 7,
+                       dots[index].x + 8, dots[index].y + 8);
+          }
+
+          auto nose_tip = [&](int x, int y, float heading, int &tip_x,
+                              int &tip_y) {
+            const float radians = heading * DEG_TO_RAD;
+            tip_x = x + (int) lroundf(sinf(radians) * NOSE);
+            tip_y = y - (int) lroundf(cosf(radians) * NOSE);
+          };
+
+          auto clip_to_ring = [&](int x0, int y0, int &x1, int &y1) {
+            if (distance_squared_px(x1, y1) <= R * R) return;
+            const int dx = x1 - x0;
+            const int dy = y1 - y0;
+            float fraction = 1.0f;
+            for (int step = 0; step < 20; step++) {
+              const int x = x0 + (int) lroundf(dx * fraction);
+              const int y = y0 + (int) lroundf(dy * fraction);
+              if (distance_squared_px(x, y) <= R * R) {
+                x1 = x;
+                y1 = y;
+                return;
+              }
+              fraction -= 0.05f;
+            }
+            x1 = x0;
+            y1 = y0;
+          };
+
+          auto draw_plane_icon = [&](int x, int y, float heading) {
+            const float radians = heading * DEG_TO_RAD;
+            const float sin_heading = sinf(radians);
+            const float cos_heading = cosf(radians);
+            const int source_width = id(flight_radar_plane_icon).get_width();
+            const int source_height = id(flight_radar_plane_icon).get_height();
+            const float source_center_x = (source_width - 1) * 0.5f;
+            const float source_center_y = (source_height - 1) * 0.5f;
+            const float source_scale =
+                (float) std::min(source_width, source_height) / ICON_SIZE;
+
+            for (int icon_y = -ICON_RADIUS;
+                 icon_y < ICON_SIZE - ICON_RADIUS; icon_y++) {
+              for (int icon_x = -ICON_RADIUS;
+                   icon_x < ICON_SIZE - ICON_RADIUS; icon_x++) {
+                const float destination_x = icon_x + 0.5f;
+                const float destination_y = icon_y + 0.5f;
+                const float source_x = source_center_x
+                    + (cos_heading * destination_x
+                       + sin_heading * destination_y) * source_scale;
+                const float source_y = source_center_y
+                    + (-sin_heading * destination_x
+                       + cos_heading * destination_y) * source_scale;
+                const int source_x0 = (int) floorf(source_x);
+                const int source_y0 = (int) floorf(source_y);
+                const float fraction_x = source_x - source_x0;
+                const float fraction_y = source_y - source_y0;
+
+                const Color samples[4] = {
+                  id(flight_radar_plane_icon).get_pixel(source_x0, source_y0),
+                  id(flight_radar_plane_icon).get_pixel(source_x0 + 1, source_y0),
+                  id(flight_radar_plane_icon).get_pixel(source_x0, source_y0 + 1),
+                  id(flight_radar_plane_icon).get_pixel(source_x0 + 1,
+                                                        source_y0 + 1),
+                };
+                const float weights[4] = {
+                  (1.0f - fraction_x) * (1.0f - fraction_y),
+                  fraction_x * (1.0f - fraction_y),
+                  (1.0f - fraction_x) * fraction_y,
+                  fraction_x * fraction_y,
+                };
+
+                float alpha = 0.0f;
+                float red = 0.0f;
+                float green = 0.0f;
+                float blue = 0.0f;
+                for (int sample = 0; sample < 4; sample++) {
+                  const float sample_alpha =
+                      weights[sample] * (samples[sample].w / 255.0f);
+                  alpha += sample_alpha;
+                  red += samples[sample].r * sample_alpha;
+                  green += samples[sample].g * sample_alpha;
+                  blue += samples[sample].b * sample_alpha;
+                }
+                if (alpha < 0.08f) continue;
+
+                red /= alpha;
+                green /= alpha;
+                blue /= alpha;
+                Color background = BG;
+                const int destination_pixel_x = x + icon_x;
+                const int destination_pixel_y = y + icon_y;
+                if (show_map
+                    && destination_pixel_x >= 0 && destination_pixel_x < W
+                    && destination_pixel_y >= 0 && destination_pixel_y < H) {
+                  background = id(flight_radar_map_10km).get_pixel(
+                      destination_pixel_x, destination_pixel_y);
+                }
+                const float inverse_alpha = 1.0f - alpha;
+                const uint8_t output_red = (uint8_t) lroundf(
+                    red * alpha + background.r * inverse_alpha);
+                const uint8_t output_green = (uint8_t) lroundf(
+                    green * alpha + background.g * inverse_alpha);
+                const uint8_t output_blue = (uint8_t) lroundf(
+                    blue * alpha + background.b * inverse_alpha);
+                it.draw_pixel_at(x + icon_x, y + icon_y,
+                                 Color(output_red, output_green, output_blue));
+              }
+            }
+          };
+
+          for (int draw_index = 0; draw_index < item_count; draw_index++) {
+            const Plane &plane = planes[items[draw_index].index];
+            const int x = items[draw_index].x;
+            const int y = items[draw_index].y;
+
+            int tip_x = 0;
+            int tip_y = 0;
+            nose_tip(x, y, plane.nose, tip_x, tip_y);
+            int dirty_end_x = tip_x;
+            int dirty_end_y = tip_y;
+
+            if (plane.ground_speed > 0.0f) {
+              const float km_per_knot_horizon =
+                  1.852f * 60.0f / 3600.0f;
+              int track_length = (int) lroundf(
+                  plane.ground_speed * km_per_knot_horizon
+                  * R / 13.3f * (1.5f / 5.0f));
+              if (track_length > 0 && track_length < 2) track_length = 2;
+              const float track_radians = plane.track * DEG_TO_RAD;
+              int end_x =
+                  tip_x + (int) lroundf(sinf(track_radians) * track_length);
+              int end_y =
+                  tip_y - (int) lroundf(cosf(track_radians) * track_length);
+              clip_to_ring(tip_x, tip_y, end_x, end_y);
+              if (end_x != tip_x || end_y != tip_y) {
+                thick_line(tip_x, tip_y, end_x, end_y, TRACK);
+                dirty_end_x = end_x;
+                dirty_end_y = end_y;
+              }
+            }
+
+            draw_plane_icon(x, y, plane.nose);
+            mark_dirty(std::min(x - ICON_RADIUS - 2, dirty_end_x - 3),
+                       std::min(y - ICON_RADIUS - 2, dirty_end_y - 3),
+                       std::max(x + ICON_RADIUS + 3, dirty_end_x + 4),
+                       std::max(y + ICON_RADIUS + 3, dirty_end_y + 4));
+          }
+
+          struct Rect {
+            int x0;
+            int y0;
+            int x1;
+            int y1;
+          };
+          struct LabelSlot {
+            int x0;
+            int y0;
+            int text_x;
+            bool right_align;
+          };
+          static Rect placed_labels[48];
+          int placed_label_count = 0;
+
+          auto rectangles_overlap = [](const Rect &a, const Rect &b) -> bool {
+            return a.x0 < b.x1 && a.x1 > b.x0
+                && a.y0 < b.y1 && a.y1 > b.y0;
+          };
+          auto clamp_int = [](int value, int low, int high) -> int {
+            return std::max(low, std::min(high, value));
+          };
+          const int MARK_CLEARANCE = ICON_RADIUS + 3;
+          auto label_is_clear = [&](const Rect &rectangle) -> bool {
+            for (int index = 0; index < placed_label_count; index++) {
+              if (rectangles_overlap(rectangle, placed_labels[index])) return false;
+            }
+            for (int index = 0; index < item_count; index++) {
+              const Rect marker = {
+                items[index].x - MARK_CLEARANCE,
+                items[index].y - MARK_CLEARANCE,
+                items[index].x + MARK_CLEARANCE + 1,
+                items[index].y + MARK_CLEARANCE + 1,
+              };
+              if (rectangles_overlap(rectangle, marker)) return false;
+            }
+            for (int index = 0; index < dot_count; index++) {
+              const Rect marker = {
+                dots[index].x - 6,
+                dots[index].y - 6,
+                dots[index].x + 7,
+                dots[index].y + 7,
+              };
+              if (rectangles_overlap(rectangle, marker)) return false;
+            }
+            return true;
+          };
+
+          auto make_label_slot = [&](int mode, int x, int y, int label_width,
+                                     int label_height) -> LabelSlot {
+            int x0 = x + MARK_CLEARANCE + 2;
+            int y0 = y - label_height / 2;
+            bool right_align = false;
+            if (mode == 1) {
+              x0 = x - MARK_CLEARANCE - 2 - label_width;
+              right_align = true;
+            } else if (mode == 2) {
+              x0 = x + 4;
+              y0 = y - MARK_CLEARANCE - 2 - label_height;
+            } else if (mode == 3) {
+              x0 = x - 4 - label_width;
+              y0 = y - MARK_CLEARANCE - 2 - label_height;
+              right_align = true;
+            } else if (mode == 4) {
+              x0 = x + 4;
+              y0 = y + MARK_CLEARANCE + 2;
+            } else if (mode == 5) {
+              x0 = x - 4 - label_width;
+              y0 = y + MARK_CLEARANCE + 2;
+              right_align = true;
+            }
+            x0 = clamp_int(x0, 0, std::max(0, W - label_width));
+            y0 = clamp_int(y0, 0, std::max(0, H - label_height));
+            const int text_x =
+                right_align ? x0 + label_width - 2 : x0 + 2;
+            return {x0, y0, text_x, right_align};
+          };
+
+          auto try_draw_label = [&](const Plane &plane, int hit_index,
+                                    int x, int y,
+                                    bool draw_callsign, bool draw_type,
+                                    bool draw_altitude) -> bool {
+            const int line_count =
+                (draw_callsign ? 1 : 0)
+                + (draw_type ? 1 : 0)
+                + (draw_altitude ? 1 : 0);
+            if (line_count == 0) return false;
+
+            const int LINE_STEP = 15;
+            const int label_height = 17 + (line_count - 1) * LINE_STEP;
+            int max_characters = 0;
+            if (draw_callsign) {
+              max_characters =
+                  std::max(max_characters, (int) strlen(plane.callsign));
+            }
+            if (draw_type) {
+              max_characters =
+                  std::max(max_characters, (int) strlen(plane.type));
+            }
+            if (draw_altitude) {
+              max_characters =
+                  std::max(max_characters, (int) strlen(plane.altitude));
+            }
+            const int label_width =
+                clamp_int(max_characters * 6 + 8, 28, 80);
+
+            for (int mode = 0; mode < 6; mode++) {
+              const LabelSlot slot =
+                  make_label_slot(mode, x, y, label_width, label_height);
+              const Rect rectangle = {
+                slot.x0,
+                slot.y0,
+                slot.x0 + label_width,
+                slot.y0 + label_height,
+              };
+              if (!label_is_clear(rectangle)) continue;
+
+              it.filled_rectangle(slot.x0, slot.y0,
+                                  label_width, label_height, BG);
+              const TextAlign alignment =
+                  slot.right_align ? TextAlign::TOP_RIGHT : TextAlign::TOP_LEFT;
+              int line_y = slot.y0 + 2;
+              if (draw_callsign) {
+                it.printf(slot.text_x, line_y, id(font_radar_small), LABEL,
+                          alignment, "%s", plane.callsign);
+                line_y += LINE_STEP;
+              }
+              if (draw_type) {
+                it.printf(slot.text_x, line_y, id(font_radar_small), TYPE_COLOR,
+                          alignment, "%s", plane.type);
+                line_y += LINE_STEP;
+              }
+              if (draw_altitude) {
+                it.printf(slot.text_x, line_y, id(font_radar_small),
+                          ALTITUDE_COLOR, alignment, "%s", plane.altitude);
+              }
+              id(flight_radar_hit_label_x0)[hit_index] = rectangle.x0;
+              id(flight_radar_hit_label_y0)[hit_index] = rectangle.y0;
+              id(flight_radar_hit_label_x1)[hit_index] = rectangle.x1;
+              id(flight_radar_hit_label_y1)[hit_index] = rectangle.y1;
+              mark_dirty(rectangle.x0, rectangle.y0,
+                         rectangle.x1, rectangle.y1);
+              placed_labels[placed_label_count++] = rectangle;
+              return true;
+            }
+            return false;
+          };
+
+          int degraded_label_count = 0;
+          int skipped_label_count = 0;
+          for (int draw_index = item_count - 1; draw_index >= 0; draw_index--) {
+            const Plane &plane = planes[items[draw_index].index];
+            const int x = items[draw_index].x;
+            const int y = items[draw_index].y;
+            const bool has_callsign = plane.callsign[0] != '\0';
+            const bool has_type = plane.type[0] != '\0';
+            const bool has_altitude = plane.altitude[0] != '\0';
+            const int line_count =
+                (has_callsign ? 1 : 0)
+                + (has_type ? 1 : 0)
+                + (has_altitude ? 1 : 0);
+            if (line_count == 0) continue;
+
+            if (try_draw_label(plane, draw_index, x, y,
+                               has_callsign, has_type, has_altitude)) {
+              continue;
+            }
+            if (line_count > 2
+                && try_draw_label(plane, draw_index, x, y,
+                                  has_callsign, has_type, false)) {
+              degraded_label_count++;
+              continue;
+            }
+
+            bool fallback_drawn = false;
+            if (has_callsign) {
+              fallback_drawn =
+                  try_draw_label(plane, draw_index, x, y,
+                                 true, false, false);
+            } else if (has_type) {
+              fallback_drawn =
+                  try_draw_label(plane, draw_index, x, y,
+                                 false, true, false);
+            } else {
+              fallback_drawn =
+                  try_draw_label(plane, draw_index, x, y,
+                                 false, false, true);
+            }
+            if (fallback_drawn) {
+              degraded_label_count++;
+            } else {
+              skipped_label_count++;
+            }
+          }
+
+          id(flight_radar_frame_duration_ms) = millis() - frame_start_ms;
+          if (id(flight_radar_frame_duration_ms)
+              > id(flight_radar_frame_max_duration_ms)) {
+            id(flight_radar_frame_max_duration_ms) =
+                id(flight_radar_frame_duration_ms);
+          }
+          id(flight_radar_frame_planes) = item_count + dot_count;
+          id(flight_radar_frame_labels) = placed_label_count;
+          id(flight_radar_frame_degraded_labels) = degraded_label_count;
+          id(flight_radar_frame_skipped_labels) = skipped_label_count;
+          if (publish_frame_diag
+              || id(flight_radar_frame_duration_ms) > 80UL) {
+            id(flight_radar_frame_last_diag_ms) = millis();
+            id(flight_radar_display_duration_ms_sensor).publish_state(
+                id(flight_radar_frame_duration_ms));
+            id(flight_radar_display_max_duration_ms_sensor).publish_state(
+                id(flight_radar_frame_max_duration_ms));
+            id(flight_radar_display_planes_sensor).publish_state(
+                id(flight_radar_frame_planes));
+            id(flight_radar_display_labels_sensor).publish_state(
+                id(flight_radar_frame_labels));
+            id(flight_radar_display_degraded_labels_sensor).publish_state(
+                id(flight_radar_frame_degraded_labels));
+            id(flight_radar_display_skipped_labels_sensor).publish_state(
+                id(flight_radar_frame_skipped_labels));
+
+            char breadcrumb[80];
+            snprintf(breadcrumb, sizeof(breadcrumb),
+                     "draw ok %ums %d planes %d labels d%d s%d",
+                     (unsigned) id(flight_radar_frame_duration_ms),
+                     id(flight_radar_frame_planes),
+                     id(flight_radar_frame_labels),
+                     id(flight_radar_frame_degraded_labels),
+                     id(flight_radar_frame_skipped_labels));
+            id(flight_radar_breadcrumb).publish_state(breadcrumb);
+          }
+
+          it.printf(5, H - 17, id(font_radar_small), GRID,
+                    TextAlign::BOTTOM_LEFT, "%d AC", plane_count);
+          mark_dirty(0, H - 35, 90, H);
+          if (id(flight_radar_fetch_in_progress)) {
+            it.printf(W - 5, H - 17, id(font_radar_small), GRID,
+                      TextAlign::BOTTOM_RIGHT, "FETCH");
+          } else {
+            it.printf(W - 5, H - 17, id(font_radar_small), GRID,
+                      TextAlign::BOTTOM_RIGHT, "%lus",
+                      (unsigned long) age_seconds);
+          }
+          mark_dirty(W - 90, H - 35, W, H);
+          commit_dirty();
