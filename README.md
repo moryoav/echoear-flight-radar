@@ -270,6 +270,12 @@ positions are ignored, while implausible corrections are held until multiple
 distinct observations confirm the relocation. The rejected, reacquired, stale,
 and maximum-correction sensors show when this protection is active.
 
+## Support me on Ko-fi
+
+If this project is useful to you, you can support its continued development:
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/Y5B124NZ2L)
+
 ## Credits and license
 
 The project was inspired by
