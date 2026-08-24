@@ -92,9 +92,32 @@ licensed under
 - ESPHome 2026.7.3 or newer; 2026.8.0 is tested
 - A 2.4 GHz Wi-Fi network with internet access
 - Python and Pillow only if generating a custom map
-- Optional FlightAware AeroAPI key for authoritative flight times
+- FlightAware AeroAPI key, optional but highly recommended for authoritative
+  flight times
 
 No Home Assistant helpers or `configuration.yaml` changes are required.
+
+## FlightAware AeroAPI
+
+A [FlightAware AeroAPI](https://www.flightaware.com/commercial/aeroapi/) key is
+highly recommended. The radar works without one, but departure and arrival times
+will remain estimates and are marked with `~`. With a key, tapping an aircraft
+requests FlightAware's current flight record so the details screen can show
+authoritative departure and arrival times. FlightAware can also fill missing
+airline information when it is available.
+
+For personal use, create a FlightAware account and API key in the
+[AeroAPI portal](https://www.flightaware.com/aeroapi/portal/). The Personal plan
+currently has no monthly minimum and includes up to $5 of API usage each month.
+The primary lookup used by this project currently costs $0.005 per result set and
+is limited to one page, so the included usage covers approximately **1,000 normal
+aircraft taps per month**. That should be more than enough for typical home use.
+
+Some taps may use a second operator lookup when airline information is missing,
+which consumes additional quota. FlightAware pricing can change, so review the
+[current AeroAPI fees](https://www.flightaware.com/commercial/aeroapi/#query-fees-breakdown)
+and monitor usage in the portal. AeroAPI is called only when an aircraft is
+selected, never by the regular five-second radar polling.
 
 ## Install
 
@@ -127,9 +150,10 @@ Create `secrets.yaml` from the example:
 cp secrets.example.yaml secrets.yaml
 ```
 
-Set your Wi-Fi values. `aeroapi_key` may remain empty; live tracking and flight
-details still work, but departure and arrival durations will be estimates when
-no authoritative time is available.
+Set your Wi-Fi values and paste the key from the FlightAware AeroAPI portal into
+`aeroapi_key`. It may remain empty; live tracking and flight details still work,
+but departure and arrival durations will be estimates when no authoritative
+time is available.
 
 Do not commit `secrets.yaml`. It is excluded by `.gitignore`.
 
