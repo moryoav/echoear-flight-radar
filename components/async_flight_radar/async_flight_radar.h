@@ -63,9 +63,12 @@ class AsyncFlightRadarComponent final : public Component {
                         const std::string &aircraft_hex);
   bool start_flight_times(const std::string &url, const std::string &callsign,
                           const std::string &aircraft_hex, const std::string &registration);
+  bool start_flight_operator(const std::string &url, const std::string &callsign,
+                             const std::string &aircraft_hex, const std::string &operator_code);
   bool is_running() const { return this->request_running_; }
   bool is_enrichment_running() const { return this->enrichment_request_running_; }
   bool is_flight_times_running() const { return this->flight_times_request_running_; }
+  bool is_flight_operator_running() const { return this->flight_operator_request_running_; }
   float get_max_step_duration_ms() const { return this->max_main_step_duration_us_ / 1000.0f; }
   uint32_t get_failure_count() const { return this->failure_count_; }
   uint32_t get_enrichment_failure_count() const { return this->enrichment_failure_count_; }
@@ -82,6 +85,11 @@ class AsyncFlightRadarComponent final : public Component {
                               float destination_lat, float destination_lon, bool route_positions_valid);
   void store_enrichment_unavailable(const std::string &callsign, const std::string &aircraft_hex);
   void store_enrichment_error(const std::string &callsign, const std::string &aircraft_hex);
+  void merge_enrichment_route(const std::string &callsign, const std::string &aircraft_hex,
+                              const std::string &origin_city, const std::string &origin_code,
+                              const std::string &destination_city, const std::string &destination_code);
+  void merge_enrichment_airline(const std::string &callsign, const std::string &aircraft_hex,
+                                const std::string &airline);
 
   Trigger<const char *, size_t, int, uint32_t> *get_response_trigger() { return &this->response_trigger_; }
   Trigger<std::string, uint32_t> *get_error_trigger() { return &this->error_trigger_; }
@@ -99,12 +107,21 @@ class AsyncFlightRadarComponent final : public Component {
   get_flight_times_error_trigger() {
     return &this->flight_times_error_trigger_;
   }
+  Trigger<const char *, size_t, int, uint32_t, std::string, std::string, std::string> *
+  get_flight_operator_response_trigger() {
+    return &this->flight_operator_response_trigger_;
+  }
+  Trigger<std::string, uint32_t, std::string, std::string, std::string> *
+  get_flight_operator_error_trigger() {
+    return &this->flight_operator_error_trigger_;
+  }
 
  protected:
   static constexpr size_t MAX_URL_SIZE = 256;
   static constexpr size_t REQUEST_KEY_SIZE = 16;
   static constexpr size_t AIRCRAFT_HEX_SIZE = 10;
   static constexpr size_t REGISTRATION_SIZE = 16;
+  static constexpr size_t OPERATOR_CODE_SIZE = 8;
   static constexpr size_t ERROR_SIZE = 96;
   static constexpr uint32_t WORKER_STACK_SIZE = 8192;
   static constexpr size_t ENRICHMENT_CACHE_SIZE = 48;
@@ -117,6 +134,7 @@ class AsyncFlightRadarComponent final : public Component {
     RADAR,
     ENRICHMENT,
     FLIGHT_TIMES,
+    FLIGHT_OPERATOR,
   };
 
   struct RequestMessage {
@@ -126,6 +144,7 @@ class AsyncFlightRadarComponent final : public Component {
     char request_key[REQUEST_KEY_SIZE];
     char aircraft_hex[AIRCRAFT_HEX_SIZE];
     char registration[REGISTRATION_SIZE];
+    char operator_code[OPERATOR_CODE_SIZE];
   };
 
   struct ResultMessage {
@@ -139,6 +158,7 @@ class AsyncFlightRadarComponent final : public Component {
     char request_key[REQUEST_KEY_SIZE];
     char aircraft_hex[AIRCRAFT_HEX_SIZE];
     char registration[REGISTRATION_SIZE];
+    char operator_code[OPERATOR_CODE_SIZE];
   };
 
   static void worker_task_entry_(void *parameter);
@@ -172,6 +192,7 @@ class AsyncFlightRadarComponent final : public Component {
   bool request_running_{false};
   bool enrichment_request_running_{false};
   bool flight_times_request_running_{false};
+  bool flight_operator_request_running_{false};
   bool worker_response_overflow_{false};
   std::atomic<bool> shutting_down_{false};
   std::atomic<uint32_t> worker_stack_high_water_bytes_{0};
@@ -185,6 +206,9 @@ class AsyncFlightRadarComponent final : public Component {
   Trigger<const char *, size_t, int, uint32_t, std::string, std::string, std::string>
       flight_times_response_trigger_;
   Trigger<std::string, uint32_t, std::string, std::string, std::string> flight_times_error_trigger_;
+  Trigger<const char *, size_t, int, uint32_t, std::string, std::string, std::string>
+      flight_operator_response_trigger_;
+  Trigger<std::string, uint32_t, std::string, std::string, std::string> flight_operator_error_trigger_;
 };
 
 }  // namespace async_flight_radar

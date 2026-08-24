@@ -513,6 +513,24 @@ async_flight_radar:
             const char *value = object[key].as<const char *>();
             return value == nullptr ? "" : std::string(value);
           };
+          auto clean_text = [](const std::string &input, size_t max_len) -> std::string {
+            std::string output;
+            output.reserve(std::min(input.size(), max_len));
+            for (char character : input) {
+              if (output.size() >= max_len) break;
+              if (character == '|' || character == ';' || character == '\r'
+                  || character == '\n' || character == '\t') {
+                character = ' ';
+              }
+              if ((unsigned char) character < 32 || (unsigned char) character > 126) continue;
+              output.push_back(character);
+            }
+            while (!output.empty() && output.back() == ' ') output.pop_back();
+            size_t first = 0;
+            while (first < output.size() && output[first] == ' ') first++;
+            if (first > 0) output.erase(0, first);
+            return output;
+          };
           auto parse_utc = [](const std::string &value) -> int64_t {
             int year = 0;
             int month = 0;
@@ -567,12 +585,29 @@ async_flight_radar:
                 || normalize(read_text(airport, "code_iata")) == expected
                 || normalize(read_text(airport, "code_lid")) == expected;
           };
+          auto airport_city = [&](JsonObject airport) -> std::string {
+            std::string city = clean_text(read_text(airport, "city"), 24);
+            if (city.empty()) city = clean_text(read_text(airport, "name"), 24);
+            return city;
+          };
+          auto airport_code = [&](JsonObject airport) -> std::string {
+            std::string code = normalize(read_text(airport, "code_iata"));
+            if (code.empty()) code = normalize(read_text(airport, "code_icao"));
+            if (code.empty()) code = normalize(read_text(airport, "code"));
+            if (code.size() > 5) code.resize(5);
+            return code;
+          };
 
           int best_score = -1;
           bool best_tied = false;
           int64_t best_actual_off = 0;
           int64_t best_estimated_on = 0;
           std::string best_ident;
+          std::string best_operator;
+          std::string best_origin_city;
+          std::string best_origin_code;
+          std::string best_destination_city;
+          std::string best_destination_code;
 
           const bool parsed = json::parse_json(
               reinterpret_cast<const uint8_t *>(body), body_length,
@@ -635,6 +670,14 @@ async_flight_radar:
                     best_actual_off = actual_off;
                     best_estimated_on = estimated_on;
                     best_ident = ident.empty() ? ident_icao : ident;
+                    best_operator = normalize(read_text(flight, "operator_icao"));
+                    if (best_operator.empty()) {
+                      best_operator = normalize(read_text(flight, "operator"));
+                    }
+                    best_origin_city = airport_city(origin);
+                    best_origin_code = airport_code(origin);
+                    best_destination_city = airport_city(destination);
+                    best_destination_code = airport_code(destination);
                   } else if (score == best_score) {
                     best_tied = true;
                   }
@@ -664,6 +707,31 @@ async_flight_radar:
           id(flight_times_cached_at_ms) = millis();
           publish_status("ready");
 
+          if (!best_origin_city.empty() && !best_destination_city.empty()) {
+            id(async_radar_http).merge_enrichment_route(
+                callsign, aircraft_hex, best_origin_city, best_origin_code,
+                best_destination_city, best_destination_code);
+            if (same_selection) id(flight_detail_apply_cached).execute();
+          }
+
+          const auto *enrichment = id(async_radar_http).find_enrichment(callsign);
+          if (same_selection && !best_operator.empty()
+              && (enrichment == nullptr || enrichment->airline[0] == '\0')
+              && !id(async_radar_http).is_flight_operator_running()) {
+            char operator_url[160];
+            snprintf(operator_url, sizeof(operator_url),
+                     "https://aeroapi.flightaware.com/aeroapi/operators/%s",
+                     best_operator.c_str());
+            if (id(async_radar_http).start_flight_operator(
+                    std::string(operator_url), callsign, aircraft_hex, best_operator)) {
+              char operator_message[72];
+              snprintf(operator_message, sizeof(operator_message),
+                       "AeroAPI %.15s operator %.7s queued",
+                       callsign.c_str(), best_operator.c_str());
+              id(flight_radar_breadcrumb).publish_state(operator_message);
+            }
+          }
+
           char message[80];
           snprintf(message, sizeof(message), "AeroAPI %.15s ready as %.15s",
                    callsign.c_str(), best_ident.c_str());
@@ -680,6 +748,99 @@ async_flight_radar:
           char message[88];
           snprintf(message, sizeof(message), "AeroAPI %.15s failed: %.42s",
                    callsign.c_str(), error.c_str());
+          id(flight_radar_breadcrumb).publish_state(message);
+  on_flight_operator_response:
+    then:
+      - lambda: |-
+          if (status_code != 200) {
+            char message[72];
+            snprintf(message, sizeof(message), "AeroAPI operator %.7s HTTP %d",
+                     operator_code.c_str(), status_code);
+            id(flight_radar_breadcrumb).publish_state(message);
+            return;
+          }
+
+          auto normalize = [](const std::string &input) -> std::string {
+            std::string output;
+            output.reserve(input.size());
+            for (char character : input) {
+              if (character >= 'a' && character <= 'z') character -= 'a' - 'A';
+              if ((character >= 'A' && character <= 'Z')
+                  || (character >= '0' && character <= '9')) {
+                output.push_back(character);
+              }
+            }
+            return output;
+          };
+          auto clean = [](const char *input, size_t max_len) -> std::string {
+            std::string output;
+            if (input == nullptr) return output;
+            for (const char *cursor = input;
+                 *cursor != '\0' && output.size() < max_len; ++cursor) {
+              char character = *cursor;
+              if (character == '|' || character == ';' || character == '\r'
+                  || character == '\n' || character == '\t') {
+                character = ' ';
+              }
+              if ((unsigned char) character < 32 || (unsigned char) character > 126) continue;
+              output.push_back(character);
+            }
+            while (!output.empty() && output.back() == ' ') output.pop_back();
+            return output;
+          };
+
+          std::string airline;
+          std::string returned_operator;
+          const bool parsed = json::parse_json(
+              reinterpret_cast<const uint8_t *>(body), body_length,
+              [&](JsonObject root) -> bool {
+                returned_operator = normalize(
+                    root["icao"].is<const char *>()
+                        ? root["icao"].as<const char *>() : "");
+                const char *name = root["name"].is<const char *>()
+                    ? root["name"].as<const char *>() : nullptr;
+                if (name == nullptr || *name == '\0') {
+                  name = root["shortname"].is<const char *>()
+                      ? root["shortname"].as<const char *>() : nullptr;
+                }
+                if (name == nullptr || *name == '\0') {
+                  name = root["callsign"].is<const char *>()
+                      ? root["callsign"].as<const char *>() : nullptr;
+                }
+                airline = clean(name, 32);
+                return true;
+              });
+
+          if (!parsed || airline.empty()
+              || (!returned_operator.empty()
+                  && returned_operator != normalize(operator_code))) {
+            char message[72];
+            snprintf(message, sizeof(message), "AeroAPI operator %.7s unavailable",
+                     operator_code.c_str());
+            id(flight_radar_breadcrumb).publish_state(message);
+            return;
+          }
+
+          id(async_radar_http).merge_enrichment_airline(
+              callsign, aircraft_hex, airline);
+          const bool same_selection =
+              (!aircraft_hex.empty() && aircraft_hex == id(flight_detail_selected_hex))
+              || (aircraft_hex.empty()
+                  && normalize(callsign) == normalize(id(flight_detail_selected_callsign)));
+          if (id(flight_detail_active) && same_selection) {
+            id(flight_detail_apply_cached).execute();
+          }
+
+          char message[80];
+          snprintf(message, sizeof(message), "AeroAPI %.15s airline %.32s",
+                   callsign.c_str(), airline.c_str());
+          id(flight_radar_breadcrumb).publish_state(message);
+  on_flight_operator_error:
+    then:
+      - lambda: |-
+          char message[88];
+          snprintf(message, sizeof(message), "AeroAPI operator %.7s failed: %.42s",
+                   operator_code.c_str(), error.c_str());
           id(flight_radar_breadcrumb).publish_state(message);
 
 button:

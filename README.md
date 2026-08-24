@@ -31,7 +31,8 @@ tracking, interactive flight details, and a local map display.
   altitude, and speed; tapping again or waiting 60 seconds returns to radar.
 - Fetches aircraft and route metadata asynchronously so tapping is immediate.
 - Optionally requests authoritative departure and arrival times from FlightAware
-  AeroAPI only after a flight is selected. Estimated values are prefixed with `~`.
+  AeroAPI only after a flight is selected. It also fills missing route and airline
+  metadata from FlightAware; estimated time values are prefixed with `~`.
 - Exposes range, units, runway visibility, backlight, touch inputs, battery, and
   diagnostics as native Home Assistant entities.
 
@@ -194,11 +195,13 @@ device through the ESPHome API.
 | --- | --- | --- |
 | [adsb.fi](https://opendata.adsb.fi/) | Every five seconds | Home coordinates and radius |
 | [ADSBDB](https://www.adsbdb.com/) | As aircraft enter the local set | ICAO hex or callsign |
-| [FlightAware AeroAPI](https://www.flightaware.com/aeroapi/) | On tap, when a key is configured | Selected callsign |
+| [FlightAware AeroAPI](https://www.flightaware.com/aeroapi/) | On tap, when a key is configured | Selected callsign and, only when needed, its operator code |
 
 API responses are handled on-device. No companion server, Home Assistant
 automation, or helper entity is needed. Provider availability and data quality
-vary; the display falls back to known ADS-B values and marked time estimates.
+vary. ADSBDB metadata remains preferred, while FlightAware fills missing route
+or airline fields and the display falls back to marked time estimates when no
+authoritative times are available.
 
 ## Project layout
 

@@ -15,6 +15,8 @@ CONF_ON_ENRICHMENT_ERROR = "on_enrichment_error"
 CONF_ON_ENRICHMENT_RESPONSE = "on_enrichment_response"
 CONF_ON_FLIGHT_TIMES_ERROR = "on_flight_times_error"
 CONF_ON_FLIGHT_TIMES_RESPONSE = "on_flight_times_response"
+CONF_ON_FLIGHT_OPERATOR_ERROR = "on_flight_operator_error"
+CONF_ON_FLIGHT_OPERATOR_RESPONSE = "on_flight_operator_response"
 
 async_flight_radar_ns = cg.esphome_ns.namespace("async_flight_radar")
 AsyncFlightRadarComponent = async_flight_radar_ns.class_(
@@ -40,6 +42,10 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_ON_FLIGHT_TIMES_RESPONSE):
                 automation.validate_automation(single=True),
             cv.Optional(CONF_ON_FLIGHT_TIMES_ERROR):
+                automation.validate_automation(single=True),
+            cv.Optional(CONF_ON_FLIGHT_OPERATOR_RESPONSE):
+                automation.validate_automation(single=True),
+            cv.Optional(CONF_ON_FLIGHT_OPERATOR_ERROR):
                 automation.validate_automation(single=True),
         }
     ).extend(cv.COMPONENT_SCHEMA),
@@ -129,6 +135,34 @@ async def to_code(config):
                 (cg.std_string, "registration"),
             ],
             on_flight_times_error,
+        )
+
+    if on_flight_operator_response := config.get(CONF_ON_FLIGHT_OPERATOR_RESPONSE):
+        await automation.build_automation(
+            var.get_flight_operator_response_trigger(),
+            [
+                (cg.const_char_ptr, "body"),
+                (cg.size_t, "body_length"),
+                (cg.int_, "status_code"),
+                (cg.uint32, "duration_ms"),
+                (cg.std_string, "callsign"),
+                (cg.std_string, "aircraft_hex"),
+                (cg.std_string, "operator_code"),
+            ],
+            on_flight_operator_response,
+        )
+
+    if on_flight_operator_error := config.get(CONF_ON_FLIGHT_OPERATOR_ERROR):
+        await automation.build_automation(
+            var.get_flight_operator_error_trigger(),
+            [
+                (cg.std_string, "error"),
+                (cg.uint32, "duration_ms"),
+                (cg.std_string, "callsign"),
+                (cg.std_string, "aircraft_hex"),
+                (cg.std_string, "operator_code"),
+            ],
+            on_flight_operator_error,
         )
 
     esp32.include_builtin_idf_component("esp_http_client")

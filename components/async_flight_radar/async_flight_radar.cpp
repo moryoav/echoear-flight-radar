@@ -157,6 +157,45 @@ bool AsyncFlightRadarComponent::start_flight_times(const std::string &url, const
   return true;
 }
 
+bool AsyncFlightRadarComponent::start_flight_operator(const std::string &url, const std::string &callsign,
+                                                       const std::string &aircraft_hex,
+                                                       const std::string &operator_code) {
+  if (this->is_failed() || this->shutting_down_.load() || this->flight_operator_request_running_ ||
+      this->request_queue_ == nullptr || this->aeroapi_key_.empty()) {
+    return false;
+  }
+  if (url.rfind("https://", 0) != 0 || url.size() >= MAX_URL_SIZE) {
+    ESP_LOGE(TAG, "Flight-operator request rejected: invalid or oversized HTTPS URL");
+    return false;
+  }
+
+  const std::string normalized_callsign = normalize_callsign_(callsign);
+  const std::string normalized_operator = normalize_callsign_(operator_code);
+  if (normalized_callsign.empty() || normalized_callsign.size() >= REQUEST_KEY_SIZE ||
+      normalized_operator.empty() || normalized_operator.size() >= OPERATOR_CODE_SIZE) {
+    ESP_LOGE(TAG, "Flight-operator request rejected: invalid callsign or operator");
+    return false;
+  }
+
+  RequestMessage request{};
+  request.type = RequestType::FLIGHT_OPERATOR;
+  request.sequence = ++this->request_sequence_;
+  std::memcpy(request.url, url.c_str(), url.size() + 1);
+  copy_text_(request.request_key, sizeof(request.request_key), normalized_callsign);
+  copy_text_(request.aircraft_hex, sizeof(request.aircraft_hex), aircraft_hex);
+  copy_text_(request.operator_code, sizeof(request.operator_code), normalized_operator);
+  if (xQueueSendToFront(this->request_queue_, &request, 0) != pdTRUE) {
+    ESP_LOGW(TAG, "Flight-operator %u rejected: worker queue is full",
+             static_cast<unsigned>(request.sequence));
+    return false;
+  }
+
+  this->flight_operator_request_running_ = true;
+  ESP_LOGD(TAG, "Flight-operator %u queued for %s (%s)", static_cast<unsigned>(request.sequence),
+           request.request_key, request.operator_code);
+  return true;
+}
+
 void AsyncFlightRadarComponent::loop() {
   if (this->result_queue_ == nullptr) return;
 
@@ -215,6 +254,26 @@ void AsyncFlightRadarComponent::loop() {
           std::string(result.error), result.duration_ms, std::string(result.request_key),
           std::string(result.aircraft_hex), std::string(result.registration));
     }
+  } else if (result.type == RequestType::FLIGHT_OPERATOR) {
+    this->flight_operator_request_running_ = false;
+    if (result.success) {
+      ESP_LOGD(TAG, "Flight-operator %u delivered for %s (%s): HTTP %d, %u bytes, %u ms",
+               static_cast<unsigned>(result.sequence), result.request_key, result.operator_code,
+               result.status_code, static_cast<unsigned>(result.response_length),
+               static_cast<unsigned>(result.duration_ms));
+      this->flight_operator_response_trigger_.trigger(
+          this->response_buffer_, result.response_length, result.status_code, result.duration_ms,
+          std::string(result.request_key), std::string(result.aircraft_hex),
+          std::string(result.operator_code));
+    } else {
+      this->flight_times_failure_count_++;
+      ESP_LOGW(TAG, "Flight-operator %u failed for %s (%s) after %u ms: %s",
+               static_cast<unsigned>(result.sequence), result.request_key, result.operator_code,
+               static_cast<unsigned>(result.duration_ms), result.error);
+      this->flight_operator_error_trigger_.trigger(
+          std::string(result.error), result.duration_ms, std::string(result.request_key),
+          std::string(result.aircraft_hex), std::string(result.operator_code));
+    }
   }
 
   this->record_main_step_duration_(step_started_us);
@@ -253,6 +312,7 @@ AsyncFlightRadarComponent::ResultMessage AsyncFlightRadarComponent::perform_requ
   copy_text_(result.request_key, sizeof(result.request_key), request.request_key);
   copy_text_(result.aircraft_hex, sizeof(result.aircraft_hex), request.aircraft_hex);
   copy_text_(result.registration, sizeof(result.registration), request.registration);
+  copy_text_(result.operator_code, sizeof(result.operator_code), request.operator_code);
   const uint32_t started_ms = millis();
   const size_t heap_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 
@@ -282,7 +342,7 @@ AsyncFlightRadarComponent::ResultMessage AsyncFlightRadarComponent::perform_requ
   } else {
     esp_http_client_set_header(client, "Accept", "application/json");
     esp_http_client_set_header(client, "Connection", "close");
-    if (request.type == RequestType::FLIGHT_TIMES) {
+    if (request.type == RequestType::FLIGHT_TIMES || request.type == RequestType::FLIGHT_OPERATOR) {
       esp_http_client_set_header(client, "x-apikey", this->aeroapi_key_.c_str());
     }
     const esp_err_t request_result = esp_http_client_perform(client);
@@ -310,7 +370,11 @@ AsyncFlightRadarComponent::ResultMessage AsyncFlightRadarComponent::perform_requ
   const size_t heap_after = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   const char *request_name = request.type == RequestType::RADAR
                                  ? "Radar"
-                                 : (request.type == RequestType::ENRICHMENT ? "Enrichment" : "Flight-times");
+                                 : (request.type == RequestType::ENRICHMENT
+                                        ? "Enrichment"
+                                        : (request.type == RequestType::FLIGHT_TIMES
+                                               ? "Flight-times"
+                                               : "Flight-operator"));
   ESP_LOGD(TAG, "%s %u worker complete in %u ms; internal heap %u -> %u bytes",
            request_name,
            static_cast<unsigned>(request.sequence), static_cast<unsigned>(result.duration_ms),
@@ -451,7 +515,7 @@ void AsyncFlightRadarComponent::store_enrichment_ready(
   const std::string normalized_callsign = normalize_callsign_(callsign);
   EnrichmentRecord *record = this->allocate_enrichment_record_(normalized_callsign, aircraft_hex);
   if (record == nullptr) return;
-  copy_text_(record->airline, sizeof(record->airline), airline);
+  if (!airline.empty()) copy_text_(record->airline, sizeof(record->airline), airline);
   copy_text_(record->origin_city, sizeof(record->origin_city), origin_city);
   copy_text_(record->origin_code, sizeof(record->origin_code), origin_code);
   record->origin_lat = origin_lat;
@@ -470,6 +534,7 @@ void AsyncFlightRadarComponent::store_enrichment_unavailable(const std::string &
   const std::string normalized_callsign = normalize_callsign_(callsign);
   EnrichmentRecord *record = this->allocate_enrichment_record_(normalized_callsign, aircraft_hex);
   if (record == nullptr) return;
+  if (record->status == EnrichmentStatus::READY) return;
   record->airline[0] = '\0';
   record->origin_city[0] = '\0';
   record->origin_code[0] = '\0';
@@ -485,9 +550,46 @@ void AsyncFlightRadarComponent::store_enrichment_error(const std::string &callsi
   const std::string normalized_callsign = normalize_callsign_(callsign);
   EnrichmentRecord *record = this->allocate_enrichment_record_(normalized_callsign, aircraft_hex);
   if (record == nullptr) return;
+  if (record->status == EnrichmentStatus::READY) return;
   record->route_positions_valid = false;
   record->status = EnrichmentStatus::RETRY;
   record->status_changed_ms = millis();
+}
+
+void AsyncFlightRadarComponent::merge_enrichment_route(
+    const std::string &callsign, const std::string &aircraft_hex, const std::string &origin_city,
+    const std::string &origin_code, const std::string &destination_city,
+    const std::string &destination_code) {
+  const std::string normalized_callsign = normalize_callsign_(callsign);
+  EnrichmentRecord *record = this->allocate_enrichment_record_(normalized_callsign, aircraft_hex);
+  if (record == nullptr) return;
+
+  if (record->origin_city[0] == '\0' && !origin_city.empty()) {
+    copy_text_(record->origin_city, sizeof(record->origin_city), origin_city);
+  }
+  if (record->origin_code[0] == '\0' && !origin_code.empty()) {
+    copy_text_(record->origin_code, sizeof(record->origin_code), origin_code);
+  }
+  if (record->destination_city[0] == '\0' && !destination_city.empty()) {
+    copy_text_(record->destination_city, sizeof(record->destination_city), destination_city);
+  }
+  if (record->destination_code[0] == '\0' && !destination_code.empty()) {
+    copy_text_(record->destination_code, sizeof(record->destination_code), destination_code);
+  }
+  if (record->origin_city[0] != '\0' && record->destination_city[0] != '\0') {
+    record->status = EnrichmentStatus::READY;
+    record->status_changed_ms = millis();
+  }
+}
+
+void AsyncFlightRadarComponent::merge_enrichment_airline(const std::string &callsign,
+                                                           const std::string &aircraft_hex,
+                                                           const std::string &airline) {
+  if (airline.empty()) return;
+  const std::string normalized_callsign = normalize_callsign_(callsign);
+  EnrichmentRecord *record = this->allocate_enrichment_record_(normalized_callsign, aircraft_hex);
+  if (record == nullptr || record->airline[0] != '\0') return;
+  copy_text_(record->airline, sizeof(record->airline), airline);
 }
 
 uint32_t AsyncFlightRadarComponent::get_enrichment_cache_ready_count() const {
