@@ -2287,13 +2287,13 @@ display:
               snprintf(speed, sizeof(speed), "%d kt",
                        (int) lroundf(id(flight_detail_selected_ground_speed)));
             }
-            it.printf(90, 283, id(font_radar_small), MUTED,
+            it.printf(112, 279, id(font_radar_small), MUTED,
                       TextAlign::TOP_CENTER, "ALTITUDE");
-            it.printf(W - 90, 283, id(font_radar_small), MUTED,
+            it.printf(W - 112, 279, id(font_radar_small), MUTED,
                       TextAlign::TOP_CENTER, "SPEED");
-            it.printf(90, 303, id(font_detail_value), ALTITUDE_COLOR,
+            it.printf(112, 299, id(font_detail_value), ALTITUDE_COLOR,
                       TextAlign::TOP_CENTER, "%s", altitude.c_str());
-            it.printf(W - 90, 303, id(font_detail_value), ALTITUDE_COLOR,
+            it.printf(W - 112, 299, id(font_detail_value), ALTITUDE_COLOR,
                       TextAlign::TOP_CENTER, "%s", speed);
             if (has_estimate) {
               it.printf(CX, H - 9, id(font_radar_small), MUTED,
