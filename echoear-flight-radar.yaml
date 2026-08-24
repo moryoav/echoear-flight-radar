@@ -5,10 +5,6 @@ substitutions:
   imageheight: "360"
   rotate_display: "0"
   timezone: "Etc/UTC"
-  # These coordinates must match the center used by tools/generate_map.py.
-  # The bundled example map is centered on London Heathrow Airport.
-  map_center_latitude: "51.4700"
-  map_center_longitude: "-0.4543"
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -32,6 +28,8 @@ esphome:
   min_version: 2026.7.3
   name_add_mac_suffix: false
   compile_process_limit: 4
+  includes:
+    - assets/flight_radar_map_metadata.h
   on_boot:
     - priority: -100
       then:
@@ -2602,8 +2600,10 @@ display:
               && id(ha_home_longitude).has_state();
           const float home_lat = has_home ? id(ha_home_latitude).state : 0.0f;
           const float home_lon = has_home ? id(ha_home_longitude).state : 0.0f;
-          constexpr float MAP_HOME_LAT = ${map_center_latitude}f;
-          constexpr float MAP_HOME_LON = ${map_center_longitude}f;
+          constexpr float MAP_HOME_LAT =
+              echoear_flight_radar_map::CENTER_LATITUDE;
+          constexpr float MAP_HOME_LON =
+              echoear_flight_radar_map::CENTER_LONGITUDE;
           image::Image *active_map = nullptr;
           if (range.rfind("5", 0) == 0) {
             active_map = id(flight_radar_map_5km);

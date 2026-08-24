@@ -5,7 +5,7 @@
 A self-contained ESPHome flight radar for the EchoEar, with live aircraft
 tracking, interactive flight details, and a local map display.
 
-[![ESPHome](https://img.shields.io/badge/ESPHome-2026.8.0-18BCF2?logo=esphome&logoColor=white)](https://esphome.io/)
+[![ESPHome](https://img.shields.io/badge/ESPHome-2026.8.1-18BCF2?logo=esphome&logoColor=white)](https://esphome.io/)
 [![Validate](https://github.com/moryoav/echoear-flight-radar/actions/workflows/validate.yml/badge.svg)](https://github.com/moryoav/echoear-flight-radar/actions/workflows/validate.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -89,7 +89,7 @@ licensed under
 
 - EchoEar v1.1
 - Home Assistant with a correctly positioned `zone.home`
-- ESPHome 2026.7.3 or newer; 2026.8.0 is tested
+- ESPHome 2026.7.3 or newer; 2026.8.1 is tested
 - A 2.4 GHz Wi-Fi network with internet access
 - Python and Pillow only if generating a custom map
 - FlightAware AeroAPI key, optional but highly recommended for authoritative
@@ -157,21 +157,18 @@ time is available.
 
 Do not commit `secrets.yaml`. It is excluded by `.gitignore`.
 
-### 3. Configure location and time zone
+### 3. Configure the time zone
 
-Home Assistant supplies the live radar center from `zone.home`. Update the
-substitutions near the top of `echoear-flight-radar.yaml`:
+Home Assistant supplies the live radar center from `zone.home`. Update the time
+zone substitution near the top of `echoear-flight-radar.yaml`:
 
 ```yaml
 substitutions:
   timezone: "Europe/London"
-  map_center_latitude: "51.4700"
-  map_center_longitude: "-0.4543"
 ```
 
-The map center must match `zone.home` within approximately 200 meters. The
-bundled example map is centered on London Heathrow; generate your own map for
-another location before flashing.
+The bundled example map is centered on London Heathrow. Generate your own map
+for another location before flashing.
 
 ### 4. Generate the local map
 
@@ -188,13 +185,20 @@ python tools/generate_map.py \
 
 The script queries OpenStreetMap through Overpass and creates four label-free
 360 x 360 PNGs aligned to the firmware's 5, 10, 15, and 25 km radar
-projections. The firmware switches backgrounds immediately when the range
-entity changes. Regenerate the complete set whenever the map center changes.
+projections. It also writes `assets/flight_radar_map_metadata.h` with the map
+center. ESPHome compiles that generated metadata into the firmware and checks
+it against `zone.home` before displaying the maps, so no coordinates need to be
+copied into the YAML. The firmware switches backgrounds immediately when the
+range entity changes. Regenerate the complete set whenever the map center
+changes.
 
 The generated files are `flight_radar_map_5km.png`,
 `flight_radar_map_10km.png`, `flight_radar_map_15km.png`, and
 `flight_radar_map_25km.png`. Large Overpass requests can take several minutes;
 rerun the command if all four files are not produced.
+
+The generated metadata contains the exact map center. Do not publish or commit
+maps and metadata generated for a private home location.
 
 The public example contains Heathrow's two runway definitions. To draw runways
 for another airport, update the `RUNWAYS` array in the display lambda or turn
@@ -260,7 +264,7 @@ authoritative times are available.
 
 ```text
 echoear-flight-radar.yaml          Main ESPHome configuration and UI
-assets/                            Plane icon and four generated range maps
+assets/                            Plane icon, generated maps, and map metadata
 components/async_flight_radar/     ESP-IDF asynchronous HTTPS worker
 tools/generate_map.py              OpenStreetMap multi-range map generator
 tools/render_readme_screenshots.py Reproducible documentation images
@@ -276,9 +280,10 @@ Confirm Home Assistant is connected through the ESPHome API and that
 
 **Aircraft appear but the map does not**
 
-Make sure all four generated map files exist and the YAML map-center
-substitutions match `zone.home`. A mismatch intentionally disables the static
-maps at every range.
+Make sure all four generated map files and
+`assets/flight_radar_map_metadata.h` were created by the same `--all-ranges`
+command. A mismatch with `zone.home` intentionally disables the static maps at
+every range.
 
 **Flight times still start with `~`**
 
