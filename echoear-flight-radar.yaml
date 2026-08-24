@@ -2733,8 +2733,16 @@ display:
             char description[36];
             char registration[16];
           };
+          struct LabelMetrics {
+            int callsign_width;
+            int type_width;
+            int altitude_width;
+            int line_height;
+          };
 
           static Plane planes[48];
+          static LabelMetrics label_metrics[48];
+          static uint32_t label_metrics_generation = UINT32_MAX;
           int plane_count = 0;
           const bool has_data = id(flight_radar_last_success_ms) != 0;
           const uint32_t age_ms =
@@ -2855,6 +2863,34 @@ display:
                   (sinf(track_radians) * movement_km) / KM_PER_DEG_LON;
             }
             plane_count++;
+          }
+
+          if (label_metrics_generation != id(flight_radar_payload_generation)) {
+            auto measure_text = [&](const char *text, int &text_width,
+                                    int &text_height) {
+              int text_x0 = 0;
+              int text_y0 = 0;
+              text_width = 0;
+              text_height = 0;
+              if (text[0] == '\0') return;
+              it.get_text_bounds(0, 0, text, id(font_radar_small),
+                                 TextAlign::TOP_LEFT, &text_x0, &text_y0,
+                                 &text_width, &text_height);
+            };
+            for (int index = 0; index < plane_count; index++) {
+              LabelMetrics &metrics = label_metrics[index];
+              int height = 0;
+              metrics = {0, 0, 0, 0};
+              measure_text(planes[index].callsign,
+                           metrics.callsign_width, height);
+              metrics.line_height = std::max(metrics.line_height, height);
+              measure_text(planes[index].type, metrics.type_width, height);
+              metrics.line_height = std::max(metrics.line_height, height);
+              measure_text(planes[index].altitude,
+                           metrics.altitude_width, height);
+              metrics.line_height = std::max(metrics.line_height, height);
+            }
+            label_metrics_generation = id(flight_radar_payload_generation);
           }
 
           if (!has_data) {
@@ -3128,6 +3164,8 @@ display:
             return std::max(low, std::min(high, value));
           };
           const int MARK_CLEARANCE = ICON_RADIUS + 3;
+          const int LABEL_PADDING = 4;
+          const int LABEL_LINE_STEP = 15;
           auto label_is_clear = [&](const Rect &rectangle) -> bool {
             for (int index = 0; index < placed_label_count; index++) {
               if (rectangles_overlap(rectangle, placed_labels[index])) return false;
@@ -3155,31 +3193,32 @@ display:
 
           auto make_label_slot = [&](int mode, int x, int y, int label_width,
                                      int label_height) -> LabelSlot {
-            int x0 = x + MARK_CLEARANCE + 2;
+            int x0 = x + MARK_CLEARANCE + 3;
             int y0 = y - label_height / 2;
             bool right_align = false;
             if (mode == 1) {
-              x0 = x - MARK_CLEARANCE - 2 - label_width;
+              x0 = x - MARK_CLEARANCE - 3 - label_width;
               right_align = true;
             } else if (mode == 2) {
               x0 = x + 4;
-              y0 = y - MARK_CLEARANCE - 2 - label_height;
+              y0 = y - MARK_CLEARANCE - 3 - label_height;
             } else if (mode == 3) {
               x0 = x - 4 - label_width;
-              y0 = y - MARK_CLEARANCE - 2 - label_height;
+              y0 = y - MARK_CLEARANCE - 3 - label_height;
               right_align = true;
             } else if (mode == 4) {
               x0 = x + 4;
-              y0 = y + MARK_CLEARANCE + 2;
+              y0 = y + MARK_CLEARANCE + 3;
             } else if (mode == 5) {
               x0 = x - 4 - label_width;
-              y0 = y + MARK_CLEARANCE + 2;
+              y0 = y + MARK_CLEARANCE + 3;
               right_align = true;
             }
             x0 = clamp_int(x0, 0, std::max(0, W - label_width));
             y0 = clamp_int(y0, 0, std::max(0, H - label_height));
             const int text_x =
-                right_align ? x0 + label_width - 2 : x0 + 2;
+                right_align ? x0 + label_width - LABEL_PADDING
+                            : x0 + LABEL_PADDING;
             return {x0, y0, text_x, right_align};
           };
 
@@ -3193,23 +3232,31 @@ display:
                 + (draw_altitude ? 1 : 0);
             if (line_count == 0) return false;
 
-            const int LINE_STEP = 15;
-            const int label_height = 17 + (line_count - 1) * LINE_STEP;
-            int max_characters = 0;
+            const LabelMetrics &metrics =
+                label_metrics[items[hit_index].index];
+            int max_text_width = 0;
             if (draw_callsign) {
-              max_characters =
-                  std::max(max_characters, (int) strlen(plane.callsign));
+              max_text_width = std::max(max_text_width,
+                                        metrics.callsign_width);
             }
             if (draw_type) {
-              max_characters =
-                  std::max(max_characters, (int) strlen(plane.type));
+              max_text_width = std::max(max_text_width,
+                                        metrics.type_width);
             }
             if (draw_altitude) {
-              max_characters =
-                  std::max(max_characters, (int) strlen(plane.altitude));
+              max_text_width = std::max(max_text_width,
+                                        metrics.altitude_width);
             }
-            const int label_width =
-                clamp_int(max_characters * 6 + 8, 28, 80);
+            const int line_height = metrics.line_height;
+            if (line_height <= 0) return false;
+
+            const int LINE_STEP = LABEL_LINE_STEP;
+            const int label_width = std::min(
+                W, std::max(2 * LABEL_PADDING + 1,
+                            max_text_width + 2 * LABEL_PADDING));
+            const int label_height = std::min(
+                H, 2 * LABEL_PADDING + line_height
+                       + (line_count - 1) * LABEL_LINE_STEP);
 
             for (int mode = 0; mode < 6; mode++) {
               const LabelSlot slot =
@@ -3226,7 +3273,7 @@ display:
                                   label_width, label_height, BG);
               const TextAlign alignment =
                   slot.right_align ? TextAlign::TOP_RIGHT : TextAlign::TOP_LEFT;
-              int line_y = slot.y0 + 2;
+              int line_y = slot.y0 + LABEL_PADDING;
               if (draw_callsign) {
                 it.printf(slot.text_x, line_y, id(font_radar_small), LABEL,
                           alignment, "%s", plane.callsign);
