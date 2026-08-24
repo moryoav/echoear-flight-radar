@@ -89,7 +89,7 @@ licensed under
 
 - EchoEar v1.1
 - Home Assistant with a correctly positioned `zone.home`
-- ESPHome 2026.7.3 or newer; 2026.8.1 is tested
+- ESPHome 2026.8.1 or newer
 - A 2.4 GHz Wi-Fi network with internet access
 - Python and Pillow only if generating a custom map
 - FlightAware AeroAPI key, optional but highly recommended for authoritative
@@ -157,20 +157,14 @@ time is available.
 
 Do not commit `secrets.yaml`. It is excluded by `.gitignore`.
 
-### 3. Configure the time zone
+### 3. Generate the local map
 
-Home Assistant supplies the live radar center from `zone.home`. Update the time
-zone substitution near the top of `echoear-flight-radar.yaml`:
-
-```yaml
-substitutions:
-  timezone: "Europe/London"
-```
+Home Assistant supplies the live radar center from `zone.home` and synchronizes
+the device clock and configured time zone through the ESPHome native API. No
+time zone setting is required in the YAML.
 
 The bundled example map is centered on London Heathrow. Generate your own map
 for another location before flashing.
-
-### 4. Generate the local map
 
 Install the map dependency and run the generator with the same coordinates:
 
@@ -204,7 +198,7 @@ The public example contains Heathrow's two runway definitions. To draw runways
 for another airport, update the `RUNWAYS` array in the display lambda or turn
 off the **Flight Radar Show Runways** entity in Home Assistant.
 
-### 5. Validate and flash
+### 4. Validate and flash
 
 Validate before connecting the device:
 

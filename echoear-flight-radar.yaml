@@ -4,7 +4,6 @@ substitutions:
   imagewidth: "360"
   imageheight: "360"
   rotate_display: "0"
-  timezone: "Etc/UTC"
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -25,7 +24,7 @@ esp32:
 esphome:
   name: ${name}
   friendly_name: ${friendly_name}
-  min_version: 2026.7.3
+  min_version: 2026.8.1
   name_add_mac_suffix: false
   compile_process_limit: 4
   includes:
@@ -83,9 +82,8 @@ api:
 json:
 
 time:
-  - platform: sntp
+  - platform: homeassistant
     id: device_time
-    timezone: ${timezone}
 
 async_flight_radar:
   id: async_radar_http
