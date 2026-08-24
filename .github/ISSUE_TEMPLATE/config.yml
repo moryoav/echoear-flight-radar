@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Installation and usage documentation
+    url: https://github.com/moryoav/echoear-flight-radar#readme
+    about: Read the setup and troubleshooting documentation before opening an issue.
+  - name: Security vulnerability
+    url: https://github.com/moryoav/echoear-flight-radar/security/policy
+    about: Review the private reporting process before disclosing a vulnerability.

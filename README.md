@@ -294,6 +294,15 @@ positions are ignored, while implausible corrections are held until multiple
 distinct observations confirm the relocation. The rejected, reacquired, stale,
 and maximum-correction sensors show when this protection is active.
 
+## Contributing and support
+
+Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) before
+opening a pull request, and use the structured issue forms for bug reports and
+feature requests. General setup guidance is in [SUPPORT.md](SUPPORT.md).
+
+Please follow the [Code of Conduct](CODE_OF_CONDUCT.md). Report vulnerabilities
+privately according to [SECURITY.md](SECURITY.md), not through a public issue.
+
 ## Support me on Ko-fi
 
 If this project is useful to you, you can support its continued development:

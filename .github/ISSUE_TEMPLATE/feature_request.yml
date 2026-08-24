@@ -1,0 +1,59 @@
+name: Feature request
+description: Suggest an improvement to EchoEar Flight Radar
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the problem or workflow first, then explain the proposed change. Search existing issues before submitting a request.
+
+  - type: textarea
+    id: use-case
+    attributes:
+      label: Use case
+      description: What problem would this feature solve, and who would benefit?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the behavior, controls, or display changes you would like.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Describe any workarounds or other designs you considered.
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Hardware scope
+      options:
+        - EchoEar v1.1
+        - Portability to another ESP32 device
+        - Not hardware-specific
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Add mockups, links, API constraints, or implementation notes that clarify the request.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Submission checks
+      options:
+        - label: I searched existing issues and did not find the same request.
+          required: true
+        - label: I removed credentials, API keys, tokens, exact home coordinates, and other private information.
+          required: true
