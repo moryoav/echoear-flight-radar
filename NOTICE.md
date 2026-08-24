@@ -15,6 +15,15 @@ The bundled map, generated maps, and README map screenshot use data from
 generator retrieves that data through the Overpass API. OpenStreetMap data is
 available under the Open Data Commons Open Database License (ODbL).
 
+## EchoEar product image
+
+`docs/echoear-product.png` is the front-view product image published by
+[Espressif Systems](https://github.com/espressif/esp-dev-kits) in the
+`esp-dev-kits` documentation repository. Documentation images in that repository
+are licensed under the
+[Creative Commons Attribution-ShareAlike 4.0 International License](https://creativecommons.org/licenses/by-sa/4.0/).
+The image is included here without modification.
+
 ## Flight data services
 
 - Live aircraft positions: [adsb.fi](https://opendata.adsb.fi/)

@@ -41,7 +41,17 @@ tracking, interactive flight details, and a local map display.
 HTTP runs in a dedicated ESP-IDF worker. The display and ESPHome main loop only
 receive bounded handoffs, avoiding long TLS requests on the UI path.
 
-## Hardware
+## Target hardware
+
+<p align="center">
+  <a href="https://s.click.aliexpress.com/e/_c3kfuJkn">
+    <img src="docs/echoear-product.png" width="420" alt="Espressif EchoEar development kit">
+  </a>
+</p>
+
+<p align="center">
+  <strong><a href="https://s.click.aliexpress.com/e/_c3kfuJkn">EchoEar product listing on AliExpress</a></strong>
+</p>
 
 This configuration is built and tested for the **Espressif EchoEar v1.1**:
 
@@ -54,9 +64,26 @@ This configuration is built and tested for the **Espressif EchoEar v1.1**:
 | Controls | Capacitive top pads and GPIO0 side button |
 | Power | Battery reporting, switched 3.3 V rail, PWM backlight |
 
+> [!IMPORTANT]
+> The included YAML was written specifically for this EchoEar hardware. Its pin
+> assignments, display driver, touch controller, power control, dimensions, and
+> memory configuration are not generic ESP32 defaults.
+
+The flight-radar design can be adapted to other ESP32 devices with screens, but
+that is a hardware port rather than a drop-in installation. At minimum, another
+device will need matching ESPHome definitions for its board, display, touch
+controller, backlight, and controls. The layout and bundled map assets may also
+need resizing for a different display resolution, and PSRAM is strongly
+recommended for the full-frame display buffer and network workloads.
+
 The microphone and speaker are intentionally inactive in this version. See the
-[Espressif EchoEar documentation](https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32s3/echoear/index.html)
+[Espressif EchoEar hardware documentation](https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32s3/esp-dev-kits-en-master-esp32s3.pdf)
 for board and flashing information.
+
+<sub>Product image: Espressif Systems, from the
+<a href="https://github.com/espressif/esp-dev-kits">esp-dev-kits documentation</a>,
+licensed under
+<a href="https://creativecommons.org/licenses/by-sa/4.0/">CC BY-SA 4.0</a>.</sub>
 
 ## Requirements
 
