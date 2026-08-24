@@ -24,8 +24,8 @@ tracking, interactive flight details, and a local map display.
 - Animates aircraft smoothly at a 100 ms display interval between network updates.
 - Compensates for ADS-B source and HTTP delivery age, ignores repeated stale
   positions, and confirms low-integrity MLAT relocations before displaying them.
-- Draws heading-oriented PNG aircraft icons, speed vectors, range rings, labels,
-  and optional runways on the EchoEar's 360 x 360 round display.
+- Draws heading-oriented PNG aircraft icons, range rings, labels, and optional
+  runways on the EchoEar's 360 x 360 round display.
 - Switches among range-aligned, label-free OpenStreetMap backgrounds for the
   5, 10, 15, and 25 km views.
 - Opens a flight details screen when the aircraft icon or its label is tapped.

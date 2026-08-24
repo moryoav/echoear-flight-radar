@@ -2352,7 +2352,6 @@ display:
           const Color GRID(16, 100, 32);
           const Color LABEL(255, 255, 255);
           const Color AIRCRAFT(255, 210, 32);
-          const Color TRACK(255, 0, 255);
           const Color TYPE_COLOR(255, 200, 0);
           const Color ALTITUDE_COLOR(90, 200, 255);
           const Color RUNWAY(56, 150, 170);
@@ -3337,7 +3336,6 @@ display:
 
           const int ICON_SIZE = 30;
           const int ICON_RADIUS = ICON_SIZE / 2;
-          const int NOSE = ICON_RADIUS;
           const int INSET = ICON_RADIUS + 2;
           const float INNER_MAX_KM =
               outer_km * ((float) (R - INSET) / (float) R);
@@ -3406,32 +3404,6 @@ display:
             mark_dirty(dots[index].x - 7, dots[index].y - 7,
                        dots[index].x + 8, dots[index].y + 8);
           }
-
-          auto nose_tip = [&](int x, int y, float heading, int &tip_x,
-                              int &tip_y) {
-            const float radians = heading * DEG_TO_RAD;
-            tip_x = x + (int) lroundf(sinf(radians) * NOSE);
-            tip_y = y - (int) lroundf(cosf(radians) * NOSE);
-          };
-
-          auto clip_to_ring = [&](int x0, int y0, int &x1, int &y1) {
-            if (distance_squared_px(x1, y1) <= R * R) return;
-            const int dx = x1 - x0;
-            const int dy = y1 - y0;
-            float fraction = 1.0f;
-            for (int step = 0; step < 20; step++) {
-              const int x = x0 + (int) lroundf(dx * fraction);
-              const int y = y0 + (int) lroundf(dy * fraction);
-              if (distance_squared_px(x, y) <= R * R) {
-                x1 = x;
-                y1 = y;
-                return;
-              }
-              fraction -= 0.05f;
-            }
-            x1 = x0;
-            y1 = y0;
-          };
 
           auto draw_plane_icon = [&](int x, int y, float heading) {
             const float radians = heading * DEG_TO_RAD;
@@ -3519,37 +3491,9 @@ display:
             const int x = items[draw_index].x;
             const int y = items[draw_index].y;
 
-            int tip_x = 0;
-            int tip_y = 0;
-            nose_tip(x, y, plane.nose, tip_x, tip_y);
-            int dirty_end_x = tip_x;
-            int dirty_end_y = tip_y;
-
-            if (plane.ground_speed > 0.0f) {
-              const float km_per_knot_horizon =
-                  1.852f * 60.0f / 3600.0f;
-              int track_length = (int) lroundf(
-                  plane.ground_speed * km_per_knot_horizon
-                  * R / 13.3f * (1.5f / 5.0f));
-              if (track_length > 0 && track_length < 2) track_length = 2;
-              const float track_radians = plane.track * DEG_TO_RAD;
-              int end_x =
-                  tip_x + (int) lroundf(sinf(track_radians) * track_length);
-              int end_y =
-                  tip_y - (int) lroundf(cosf(track_radians) * track_length);
-              clip_to_ring(tip_x, tip_y, end_x, end_y);
-              if (end_x != tip_x || end_y != tip_y) {
-                thick_line(tip_x, tip_y, end_x, end_y, TRACK);
-                dirty_end_x = end_x;
-                dirty_end_y = end_y;
-              }
-            }
-
             draw_plane_icon(x, y, plane.nose);
-            mark_dirty(std::min(x - ICON_RADIUS - 2, dirty_end_x - 3),
-                       std::min(y - ICON_RADIUS - 2, dirty_end_y - 3),
-                       std::max(x + ICON_RADIUS + 3, dirty_end_x + 4),
-                       std::max(y + ICON_RADIUS + 3, dirty_end_y + 4));
+            mark_dirty(x - ICON_RADIUS - 2, y - ICON_RADIUS - 2,
+                       x + ICON_RADIUS + 3, y + ICON_RADIUS + 3);
           }
 
           struct Rect {
