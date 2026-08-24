@@ -1420,8 +1420,23 @@ font:
 
 image:
   - platform: file
+    file: assets/flight_radar_map_5km.png
+    id: flight_radar_map_5km
+    type: RGB565
+
+  - platform: file
     file: assets/flight_radar_map_10km.png
     id: flight_radar_map_10km
+    type: RGB565
+
+  - platform: file
+    file: assets/flight_radar_map_15km.png
+    id: flight_radar_map_15km
+    type: RGB565
+
+  - platform: file
+    file: assets/flight_radar_map_25km.png
+    id: flight_radar_map_25km
     type: RGB565
 
   - platform: file
@@ -2325,8 +2340,18 @@ display:
           const float home_lon = has_home ? id(ha_home_longitude).state : 0.0f;
           constexpr float MAP_HOME_LAT = ${map_center_latitude}f;
           constexpr float MAP_HOME_LON = ${map_center_longitude}f;
+          image::Image *active_map = nullptr;
+          if (range.rfind("5", 0) == 0) {
+            active_map = id(flight_radar_map_5km);
+          } else if (range.rfind("10", 0) == 0) {
+            active_map = id(flight_radar_map_10km);
+          } else if (range.rfind("15", 0) == 0) {
+            active_map = id(flight_radar_map_15km);
+          } else if (range.rfind("25", 0) == 0) {
+            active_map = id(flight_radar_map_25km);
+          }
           const bool show_map = has_home
-              && range.rfind("10", 0) == 0
+              && active_map != nullptr
               && fabsf(home_lat - MAP_HOME_LAT) < 0.002f
               && fabsf(home_lon - MAP_HOME_LON) < 0.002f;
           const bool show_runways = id(flight_radar_show_runways).state;
@@ -2370,7 +2395,7 @@ display:
               || radar_last_range != range;
           if (rebuild_radar_base) {
             it.fill(BG);
-            if (show_map) it.image(0, 0, id(flight_radar_map_10km));
+            if (show_map) it.image(0, 0, active_map);
             previous_dirty_count = 0;
             radar_base_initialized = true;
             radar_last_show_map = show_map;
@@ -2389,7 +2414,7 @@ display:
               for (int y = rectangle.y0; y < rectangle.y1; y++) {
                 for (int x = rectangle.x0; x < rectangle.x1; x++) {
                   it.draw_pixel_at(x, y,
-                                   id(flight_radar_map_10km).get_pixel(x, y));
+                                   active_map->get_pixel(x, y));
                 }
               }
             }
@@ -2865,7 +2890,7 @@ display:
                 if (show_map
                     && destination_pixel_x >= 0 && destination_pixel_x < W
                     && destination_pixel_y >= 0 && destination_pixel_y < H) {
-                  background = id(flight_radar_map_10km).get_pixel(
+                  background = active_map->get_pixel(
                       destination_pixel_x, destination_pixel_y);
                 }
                 const float inverse_alpha = 1.0f - alpha;

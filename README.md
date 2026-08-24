@@ -24,7 +24,8 @@ tracking, interactive flight details, and a local map display.
 - Animates aircraft smoothly at a 100 ms display interval between network updates.
 - Draws heading-oriented PNG aircraft icons, speed vectors, range rings, labels,
   and optional runways on the EchoEar's 360 x 360 round display.
-- Uses a subtle, label-free OpenStreetMap background in the 10 km view.
+- Switches among range-aligned, label-free OpenStreetMap backgrounds for the
+  5, 10, 15, and 25 km views.
 - Opens a flight details screen when the aircraft icon or its label is tapped.
 - Shows callsign, airline, route, elapsed/remaining time, aircraft type,
   altitude, and speed; tapping again or waiting 60 seconds returns to radar.
@@ -127,13 +128,19 @@ python -m pip install -r requirements-map.txt
 python tools/generate_map.py \
   --lat 51.4700 \
   --lon -0.4543 \
-  --output assets/flight_radar_map_10km.png
+  --all-ranges \
+  --output-dir assets
 ```
 
-The script queries OpenStreetMap through Overpass and creates a label-free
-360 x 360 PNG aligned to the firmware's 10 km radar projection. Regenerate it
-whenever the map center changes. The map is displayed only for the 10 km range;
-other ranges use the plain radar background to prevent geographic misalignment.
+The script queries OpenStreetMap through Overpass and creates four label-free
+360 x 360 PNGs aligned to the firmware's 5, 10, 15, and 25 km radar
+projections. The firmware switches backgrounds immediately when the range
+entity changes. Regenerate the complete set whenever the map center changes.
+
+The generated files are `flight_radar_map_5km.png`,
+`flight_radar_map_10km.png`, `flight_radar_map_15km.png`, and
+`flight_radar_map_25km.png`. Large Overpass requests can take several minutes;
+rerun the command if all four files are not produced.
 
 The public example contains Heathrow's two runway definitions. To draw runways
 for another airport, update the `RUNWAYS` array in the display lambda or turn
@@ -197,9 +204,9 @@ vary; the display falls back to known ADS-B values and marked time estimates.
 
 ```text
 echoear-flight-radar.yaml          Main ESPHome configuration and UI
-assets/                            Plane icon and generated 10 km map
+assets/                            Plane icon and four generated range maps
 components/async_flight_radar/     ESP-IDF asynchronous HTTPS worker
-tools/generate_map.py              OpenStreetMap background generator
+tools/generate_map.py              OpenStreetMap multi-range map generator
 tools/render_readme_screenshots.py Reproducible documentation images
 docs/                              README screenshots
 ```
@@ -213,8 +220,9 @@ Confirm Home Assistant is connected through the ESPHome API and that
 
 **Aircraft appear but the map does not**
 
-Select the 10 km range and make sure the YAML map-center substitutions match
-`zone.home`. A mismatch intentionally disables the static map.
+Make sure all four generated map files exist and the YAML map-center
+substitutions match `zone.home`. A mismatch intentionally disables the static
+maps at every range.
 
 **Flight times still start with `~`**
 

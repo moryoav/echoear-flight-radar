@@ -19,6 +19,8 @@ OVERPASS_URLS = (
     "https://overpass.kumi.systems/api/interpreter",
 )
 
+SUPPORTED_RANGES_KM = (5.0, 10.0, 15.0, 25.0)
+
 BACKGROUND = (4, 10, 28, 255)
 STYLES = {
     "green": ((16, 76, 47, 125), 0),
@@ -52,9 +54,25 @@ def parse_args() -> argparse.Namespace:
         default=Path("assets/flight_radar_map_10km.png"),
     )
     parser.add_argument(
+        "--all-ranges",
+        action="store_true",
+        help="Generate the 5, 10, 15, and 25 km firmware map set",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("assets"),
+        help="Output directory used with --all-ranges (default: assets)",
+    )
+    parser.add_argument(
         "--cache",
         type=Path,
         help="Optional path for caching the raw Overpass response",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        help="Optional Overpass cache directory used with --all-ranges",
     )
     return parser.parse_args()
 
@@ -80,19 +98,20 @@ out tags geom;
 def fetch_overpass(query: str) -> dict:
     payload = urllib.parse.urlencode({"data": query}).encode("utf-8")
     last_error: Exception | None = None
-    for index, url in enumerate(OVERPASS_URLS):
-        request = urllib.request.Request(
-            url,
-            data=payload,
-            headers={"User-Agent": "echoear-flight-radar-map-generator/1.0"},
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=150) as response:
-                return json.load(response)
-        except Exception as error:  # pragma: no cover - depends on remote service
-            last_error = error
-            if index + 1 < len(OVERPASS_URLS):
-                time.sleep(2)
+    for attempt in range(3):
+        for url in OVERPASS_URLS:
+            request = urllib.request.Request(
+                url,
+                data=payload,
+                headers={"User-Agent": "echoear-flight-radar-map-generator/1.0"},
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=150) as response:
+                    return json.load(response)
+            except Exception as error:  # pragma: no cover - remote service
+                last_error = error
+        if attempt < 2:
+            time.sleep(3 * (attempt + 1))
     raise RuntimeError(f"Overpass request failed: {last_error}")
 
 
@@ -182,6 +201,37 @@ def render(data: dict, lat: float, lon: float, ring_km: float) -> Image.Image:
     return image.convert("RGB")
 
 
+def generate_map(
+    lat: float,
+    lon: float,
+    ring_km: float,
+    output: Path,
+    cache: Path | None,
+) -> None:
+    edge_km = ring_km * 4.0 / 3.0
+    margin_km = edge_km * 1.08
+    lat_delta = margin_km / 110.574
+    lon_delta = margin_km / (111.320 * math.cos(math.radians(lat)))
+    query = build_query(
+        lat - lat_delta,
+        lon - lon_delta,
+        lat + lat_delta,
+        lon + lon_delta,
+    )
+
+    if cache and cache.exists():
+        data = json.loads(cache.read_text(encoding="utf-8"))
+    else:
+        data = fetch_overpass(query)
+        if cache:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_text(json.dumps(data), encoding="utf-8")
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    render(data, lat, lon, ring_km).save(output, optimize=True)
+    print(f"Wrote {output} ({len(data.get('elements', []))} OSM ways)")
+
+
 def main() -> None:
     args = parse_args()
     if not -90 <= args.lat <= 90 or not -180 <= args.lon <= 180:
@@ -189,28 +239,24 @@ def main() -> None:
     if args.ring_km <= 0:
         raise SystemExit("--ring-km must be positive")
 
-    edge_km = args.ring_km * 4.0 / 3.0
-    margin_km = edge_km * 1.08
-    lat_delta = margin_km / 110.574
-    lon_delta = margin_km / (111.320 * math.cos(math.radians(args.lat)))
-    query = build_query(
-        args.lat - lat_delta,
-        args.lon - lon_delta,
-        args.lat + lat_delta,
-        args.lon + lon_delta,
-    )
+    if args.all_ranges:
+        for ring_km in SUPPORTED_RANGES_KM:
+            suffix = f"{int(ring_km)}km"
+            cache = (
+                args.cache_dir / f"overpass_{suffix}.json"
+                if args.cache_dir
+                else None
+            )
+            generate_map(
+                args.lat,
+                args.lon,
+                ring_km,
+                args.output_dir / f"flight_radar_map_{suffix}.png",
+                cache,
+            )
+        return
 
-    if args.cache and args.cache.exists():
-        data = json.loads(args.cache.read_text(encoding="utf-8"))
-    else:
-        data = fetch_overpass(query)
-        if args.cache:
-            args.cache.parent.mkdir(parents=True, exist_ok=True)
-            args.cache.write_text(json.dumps(data), encoding="utf-8")
-
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    render(data, args.lat, args.lon, args.ring_km).save(args.output, optimize=True)
-    print(f"Wrote {args.output} ({len(data.get('elements', []))} OSM ways)")
+    generate_map(args.lat, args.lon, args.ring_km, args.output, args.cache)
 
 
 if __name__ == "__main__":
