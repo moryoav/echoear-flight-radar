@@ -117,7 +117,7 @@ async_flight_radar:
           }
 
           std::string payload;
-          payload.reserve(4096);
+          payload.reserve(8192);
           int count = 0;
 
           auto parsed = json::parse_json(
@@ -125,6 +125,24 @@ async_flight_radar:
               [&](JsonObject root) -> bool {
                 JsonArray aircraft = root["ac"].as<JsonArray>();
                 if (aircraft.isNull()) return true;
+
+                float response_delivery_age =
+                    std::min(10.0f, (float) duration_ms / 1000.0f);
+                if (!root["now"].isNull()) {
+                  struct timeval receive_time {};
+                  if (gettimeofday(&receive_time, nullptr) == 0
+                      && receive_time.tv_sec > 1700000000) {
+                    const double local_now =
+                        (double) receive_time.tv_sec
+                        + (double) receive_time.tv_usec / 1000000.0;
+                    const double server_now = root["now"].as<double>();
+                    const double delivery_age = local_now - server_now;
+                    if (delivery_age >= -0.5 && delivery_age <= 15.0) {
+                      response_delivery_age =
+                          std::max(0.0f, (float) delivery_age);
+                    }
+                  }
+                }
 
                 auto read_float = [](JsonObject object, const char *key,
                                      float *value) -> bool {
@@ -182,6 +200,15 @@ async_flight_radar:
                   else if (read_float(plane, "tas", &value)) ground_speed = value;
                   else if (read_float(plane, "ias", &value)) ground_speed = value;
 
+                  float seen_position = 0.0f;
+                  if (!read_float(plane, "seen_pos", &seen_position)) {
+                    seen_position = 0.0f;
+                  }
+                  seen_position = std::max(0.0f,
+                                           std::min(120.0f, seen_position));
+                  const float position_age =
+                      seen_position + response_delivery_age;
+
                   const std::string callsign = clean(
                       plane["flight"].is<const char *>()
                           ? plane["flight"].as<const char *>()
@@ -207,6 +234,28 @@ async_flight_radar:
                           ? plane["r"].as<const char *>()
                           : nullptr,
                       15);
+                  const std::string source_type = clean(
+                      plane["type"].is<const char *>()
+                          ? plane["type"].as<const char *>()
+                          : nullptr,
+                      12);
+                  bool position_mlat = source_type == "mlat";
+                  JsonArray mlat_fields = plane["mlat"].as<JsonArray>();
+                  if (!mlat_fields.isNull()) {
+                    for (JsonVariant field : mlat_fields) {
+                      if (!field.is<const char *>()) continue;
+                      const char *field_name = field.as<const char *>();
+                      if (field_name != nullptr
+                          && (strcmp(field_name, "lat") == 0
+                              || strcmp(field_name, "lon") == 0)) {
+                        position_mlat = true;
+                      }
+                    }
+                  }
+                  int nic = -1;
+                  int rc = -1;
+                  if (read_float(plane, "nic", &value)) nic = (int) lroundf(value);
+                  if (read_float(plane, "rc", &value)) rc = (int) lroundf(value);
 
                   char altitude[16] = "";
                   float altitude_value = 0.0f;
@@ -229,12 +278,14 @@ async_flight_radar:
                     id(flight_detail_selected_altitude) = altitude;
                   }
 
-                  char record[240];
+                  char record[300];
                   snprintf(record, sizeof(record),
-                           "%.5f|%.5f|%.1f|%.1f|%.1f|%s|%s|%s|%s|%s|%s;",
+                           "%.5f|%.5f|%.1f|%.1f|%.1f|%s|%s|%s|%s|%s|%s|%.2f|%s|%d|%d|%d;",
                            lat, lon, nose, track, ground_speed,
                            callsign.c_str(), type.c_str(), altitude,
-                           hex.c_str(), description.c_str(), registration.c_str());
+                           hex.c_str(), description.c_str(), registration.c_str(),
+                           position_age, source_type.c_str(),
+                           position_mlat ? 1 : 0, nic, rc);
                   payload += record;
                   count++;
                 }
@@ -980,6 +1031,39 @@ sensor:
     lambda: return id(async_radar_http).get_failure_count();
 
   - platform: template
+    name: "Flight Radar Rejected Positions"
+    icon: "mdi:map-marker-alert-outline"
+    accuracy_decimals: 0
+    update_interval: 10s
+    entity_category: diagnostic
+    lambda: return id(flight_radar_position_rejections);
+
+  - platform: template
+    name: "Flight Radar Reacquired Positions"
+    icon: "mdi:map-marker-check-outline"
+    accuracy_decimals: 0
+    update_interval: 10s
+    entity_category: diagnostic
+    lambda: return id(flight_radar_position_reacquisitions);
+
+  - platform: template
+    name: "Flight Radar Stale Position Samples"
+    icon: "mdi:map-marker-off-outline"
+    accuracy_decimals: 0
+    update_interval: 10s
+    entity_category: diagnostic
+    lambda: return id(flight_radar_stale_position_samples);
+
+  - platform: template
+    name: "Flight Radar Maximum Position Correction"
+    icon: "mdi:map-marker-distance"
+    unit_of_measurement: "m"
+    accuracy_decimals: 0
+    update_interval: 10s
+    entity_category: diagnostic
+    lambda: return id(flight_radar_position_correction_max_m);
+
+  - platform: template
     id: flight_detail_http_failures_sensor
     name: "Flight Detail HTTP Failures"
     icon: "mdi:alert-outline"
@@ -1280,6 +1364,26 @@ globals:
     type: int
     restore_value: false
     initial_value: "0"
+
+  - id: flight_radar_position_rejections
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+  - id: flight_radar_position_reacquisitions
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+  - id: flight_radar_stale_position_samples
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+  - id: flight_radar_position_correction_max_m
+    type: float
+    restore_value: false
+    initial_value: "0.0"
 
   - id: flight_radar_frame_started_ms
     type: uint32_t
@@ -1810,15 +1914,15 @@ script:
                 };
 
                 while (cursor < end) {
-                  std::string fields[11];
+                  std::string fields[16];
                   bool complete = true;
-                  for (int index = 0; index < 11; index++) {
+                  for (int index = 0; index < 16; index++) {
                     const char delimiter = read_field(&fields[index]);
-                    if (index < 10 && delimiter != '|') {
+                    if (index < 15 && delimiter != '|') {
                       complete = false;
                       break;
                     }
-                    if (index == 10 && delimiter != ';' && delimiter != '\0') {
+                    if (index == 15 && delimiter != ';' && delimiter != '\0') {
                       complete = false;
                     }
                   }
@@ -2726,12 +2830,44 @@ display:
             float nose;
             float track;
             float ground_speed;
+            float position_age;
+            bool position_mlat;
+            int nic;
+            int rc;
             char callsign[12];
             char type[8];
             char altitude[18];
             char hex[10];
             char description[36];
             char registration[16];
+            char source_type[14];
+          };
+          struct TrackState {
+            bool used;
+            bool motion_valid;
+            char key[12];
+            float anchor_lat;
+            float anchor_lon;
+            float nose;
+            float track;
+            float ground_speed;
+            uint32_t anchor_ms;
+            uint32_t last_payload_ms;
+            float last_raw_lat;
+            float last_raw_lon;
+            uint32_t last_observation_ms;
+            bool candidate_valid;
+            uint8_t candidate_count;
+            float candidate_lat;
+            float candidate_lon;
+            float candidate_raw_lat;
+            float candidate_raw_lon;
+            float candidate_nose;
+            float candidate_track;
+            float candidate_ground_speed;
+            uint32_t candidate_ms;
+            uint32_t candidate_observation_ms;
+            uint32_t candidate_first_ms;
           };
           struct LabelMetrics {
             int callsign_width;
@@ -2741,15 +2877,19 @@ display:
           };
 
           static Plane planes[48];
+          static TrackState tracks[48];
           static LabelMetrics label_metrics[48];
           static uint32_t label_metrics_generation = UINT32_MAX;
+          static uint32_t tracker_generation = UINT32_MAX;
           int plane_count = 0;
           const bool has_data = id(flight_radar_last_success_ms) != 0;
           const uint32_t age_ms =
               has_data ? millis() - id(flight_radar_last_success_ms) : 0UL;
           const uint32_t age_seconds = age_ms / 1000UL;
-          const float prediction_seconds =
-              has_data ? std::min(30.0f, (float) age_ms / 1000.0f) : 0.0f;
+          const bool new_payload =
+              tracker_generation != id(flight_radar_payload_generation);
+          constexpr float MAX_SOURCE_AGE_SECONDS = 12.0f;
+          constexpr float MAX_EXTRAPOLATION_SECONDS = 12.0f;
 
           const std::string &payload = id(flight_radar_aircraft_payload);
           const char *cursor = payload.c_str();
@@ -2772,6 +2912,28 @@ display:
           auto skip_record = [&]() {
             while (cursor < end && *cursor != ';') cursor++;
             if (cursor < end) cursor++;
+          };
+
+          auto project_motion = [&](float lat, float lon, float track,
+                                    float ground_speed, float seconds,
+                                    float &projected_lat,
+                                    float &projected_lon) {
+            projected_lat = lat;
+            projected_lon = lon;
+            if (ground_speed <= 0.0f || seconds <= 0.0f) return;
+            const float movement_km =
+                ground_speed * 1.852f * (seconds / 3600.0f);
+            const float track_radians = track * DEG_TO_RAD;
+            projected_lat +=
+                (cosf(track_radians) * movement_km) / KM_PER_DEG_LAT;
+            projected_lon +=
+                (sinf(track_radians) * movement_km) / KM_PER_DEG_LON;
+          };
+          auto position_distance_m = [&](float lat_a, float lon_a,
+                                         float lat_b, float lon_b) {
+            const float dx = (lon_b - lon_a) * KM_PER_DEG_LON;
+            const float dy = (lat_b - lat_a) * KM_PER_DEG_LAT;
+            return sqrtf(dx * dx + dy * dy) * 1000.0f;
           };
 
           while (cursor < end && plane_count < 48) {
@@ -2845,24 +3007,273 @@ display:
             }
 
             delimiter = read_field(plane.registration, sizeof(plane.registration));
+            if (delimiter != '|') {
+              if (delimiter == '\0') break;
+              continue;
+            }
+
+            delimiter = read_field(field, sizeof(field));
+            if (delimiter != '|') {
+              if (delimiter == '\0') break;
+              continue;
+            }
+            plane.position_age = strtof(field, nullptr);
+
+            delimiter = read_field(plane.source_type,
+                                   sizeof(plane.source_type));
+            if (delimiter != '|') {
+              if (delimiter == '\0') break;
+              continue;
+            }
+
+            delimiter = read_field(field, sizeof(field));
+            if (delimiter != '|') {
+              if (delimiter == '\0') break;
+              continue;
+            }
+            plane.position_mlat = strtol(field, nullptr, 10) != 0;
+
+            delimiter = read_field(field, sizeof(field));
+            if (delimiter != '|') {
+              if (delimiter == '\0') break;
+              continue;
+            }
+            plane.nic = (int) strtol(field, nullptr, 10);
+
+            delimiter = read_field(field, sizeof(field));
+            plane.rc = (int) strtol(field, nullptr, 10);
             if (delimiter != ';' && delimiter != '\0') skip_record();
             if (plane.callsign[0] == '\0') {
               strncpy(plane.callsign, plane.hex, sizeof(plane.callsign) - 1);
               plane.callsign[sizeof(plane.callsign) - 1] = '\0';
             }
 
-            plane.predicted_lat = plane.lat;
-            plane.predicted_lon = plane.lon;
-            if (plane.ground_speed > 0.0f && prediction_seconds > 0.0f) {
-              const float movement_km =
-                  plane.ground_speed * 1.852f * (prediction_seconds / 3600.0f);
-              const float track_radians = plane.track * DEG_TO_RAD;
-              plane.predicted_lat +=
-                  (cosf(track_radians) * movement_km) / KM_PER_DEG_LAT;
-              plane.predicted_lon +=
-                  (sinf(track_radians) * movement_km) / KM_PER_DEG_LON;
+            const char *track_key =
+                plane.hex[0] != '\0' ? plane.hex : plane.callsign;
+            int track_index = -1;
+            int free_track_index = -1;
+            int oldest_track_index = 0;
+            uint32_t oldest_track_age = 0;
+            for (int index = 0; index < 48; index++) {
+              TrackState &candidate = tracks[index];
+              if (candidate.used && strcmp(candidate.key, track_key) == 0) {
+                track_index = index;
+                break;
+              }
+              if (!candidate.used && free_track_index < 0) {
+                free_track_index = index;
+              }
+              if (candidate.used) {
+                const uint32_t candidate_age =
+                    frame_start_ms - candidate.last_payload_ms;
+                if (candidate_age >= oldest_track_age) {
+                  oldest_track_age = candidate_age;
+                  oldest_track_index = index;
+                }
+              }
             }
+            if (track_index < 0) {
+              track_index = free_track_index >= 0
+                  ? free_track_index : oldest_track_index;
+              tracks[track_index] = {};
+              TrackState &new_track = tracks[track_index];
+              new_track.used = true;
+              strncpy(new_track.key, track_key, sizeof(new_track.key) - 1);
+              new_track.key[sizeof(new_track.key) - 1] = '\0';
+            }
+
+            TrackState &state = tracks[track_index];
+            if (new_payload) {
+              state.last_payload_ms = frame_start_ms;
+              const float handoff_seconds =
+                  (float) (frame_start_ms - id(flight_radar_last_success_ms))
+                  / 1000.0f;
+              const float measurement_age =
+                  std::max(0.0f, plane.position_age + handoff_seconds);
+              const uint32_t measurement_age_ms = (uint32_t) std::min(
+                  120000.0f, measurement_age * 1000.0f);
+              const uint32_t observation_ms =
+                  frame_start_ms - measurement_age_ms;
+              const bool stale_measurement =
+                  measurement_age > MAX_SOURCE_AGE_SECONDS;
+              const bool observation_advanced =
+                  state.anchor_ms == 0
+                  || (int32_t) (observation_ms - state.last_observation_ms) > 500;
+              const bool repeated_position =
+                  state.anchor_ms != 0
+                  && (!observation_advanced
+                      || (fabsf(plane.lat - state.last_raw_lat) < 0.000002f
+                          && fabsf(plane.lon - state.last_raw_lon) < 0.000002f));
+
+              if (state.anchor_ms == 0) {
+                state.anchor_lat = plane.lat;
+                state.anchor_lon = plane.lon;
+                state.nose = plane.nose;
+                state.track = plane.track;
+                state.ground_speed = plane.ground_speed;
+                state.anchor_ms = frame_start_ms;
+                state.motion_valid = !stale_measurement;
+                if (state.motion_valid) {
+                  project_motion(plane.lat, plane.lon, plane.track,
+                                 plane.ground_speed, measurement_age,
+                                 state.anchor_lat, state.anchor_lon);
+                } else {
+                  id(flight_radar_stale_position_samples)++;
+                }
+                state.last_raw_lat = plane.lat;
+                state.last_raw_lon = plane.lon;
+                state.last_observation_ms = observation_ms;
+              } else if (stale_measurement || repeated_position) {
+                id(flight_radar_stale_position_samples)++;
+              } else {
+                float measured_lat = plane.lat;
+                float measured_lon = plane.lon;
+                project_motion(plane.lat, plane.lon, plane.track,
+                               plane.ground_speed, measurement_age,
+                               measured_lat, measured_lon);
+
+                const float state_age = std::min(
+                    MAX_EXTRAPOLATION_SECONDS,
+                    (float) (frame_start_ms - state.anchor_ms) / 1000.0f);
+                float expected_lat = state.anchor_lat;
+                float expected_lon = state.anchor_lon;
+                if (state.motion_valid) {
+                  project_motion(state.anchor_lat, state.anchor_lon,
+                                 state.track, state.ground_speed, state_age,
+                                 expected_lat, expected_lon);
+                }
+                const float correction_m = position_distance_m(
+                    expected_lat, expected_lon, measured_lat, measured_lon);
+                if (correction_m > id(flight_radar_position_correction_max_m)) {
+                  id(flight_radar_position_correction_max_m) = correction_m;
+                }
+
+                const bool low_integrity =
+                    plane.position_mlat || plane.nic == 0;
+                float correction_gate_m = low_integrity ? 1000.0f : 1500.0f;
+                if (plane.rc > 0) {
+                  correction_gate_m = std::max(
+                      correction_gate_m,
+                      std::min(3000.0f, 300.0f + 4.0f * plane.rc));
+                }
+
+                bool accept_measurement = correction_m <= correction_gate_m;
+                bool reacquired = false;
+                if (!accept_measurement) {
+                  const float candidate_gate_m =
+                      low_integrity ? 500.0f : 750.0f;
+                  const uint8_t required_candidates =
+                      low_integrity ? 4 : 2;
+                  bool update_candidate = false;
+                  if (state.candidate_valid) {
+                    const bool candidate_observation_advanced =
+                        (int32_t) (observation_ms
+                                   - state.candidate_observation_ms) > 500;
+                    const bool candidate_position_changed =
+                        fabsf(plane.lat - state.candidate_raw_lat) >= 0.000002f
+                        || fabsf(plane.lon - state.candidate_raw_lon) >= 0.000002f;
+                    if (candidate_observation_advanced
+                        && candidate_position_changed) {
+                      const float candidate_age = std::min(
+                          MAX_EXTRAPOLATION_SECONDS,
+                          (float) (frame_start_ms - state.candidate_ms) / 1000.0f);
+                      float candidate_lat = state.candidate_lat;
+                      float candidate_lon = state.candidate_lon;
+                      project_motion(state.candidate_lat, state.candidate_lon,
+                                     state.candidate_track,
+                                     state.candidate_ground_speed,
+                                     candidate_age, candidate_lat, candidate_lon);
+                      const float candidate_correction_m = position_distance_m(
+                          candidate_lat, candidate_lon,
+                          measured_lat, measured_lon);
+                      if (candidate_correction_m <= candidate_gate_m) {
+                        state.candidate_count++;
+                      } else {
+                        state.candidate_count = 1;
+                        state.candidate_first_ms = frame_start_ms;
+                      }
+                      update_candidate = true;
+                      const bool candidate_span_sufficient =
+                          !low_integrity
+                          || frame_start_ms - state.candidate_first_ms >= 8000UL;
+                      accept_measurement =
+                          state.candidate_count >= required_candidates
+                          && candidate_span_sufficient;
+                      reacquired = accept_measurement;
+                    } else {
+                      id(flight_radar_stale_position_samples)++;
+                    }
+                  } else {
+                    state.candidate_valid = true;
+                    state.candidate_count = 1;
+                    state.candidate_first_ms = frame_start_ms;
+                    update_candidate = true;
+                  }
+
+                  if (!accept_measurement) {
+                    if (update_candidate) {
+                      state.candidate_lat = measured_lat;
+                      state.candidate_lon = measured_lon;
+                      state.candidate_raw_lat = plane.lat;
+                      state.candidate_raw_lon = plane.lon;
+                      state.candidate_nose = plane.nose;
+                      state.candidate_track = plane.track;
+                      state.candidate_ground_speed = plane.ground_speed;
+                      state.candidate_ms = frame_start_ms;
+                      state.candidate_observation_ms = observation_ms;
+                      id(flight_radar_position_rejections)++;
+                      ESP_LOGW("flight_tracker",
+                               "%s rejected %.0fm gate %.0fm age %.1fs source=%s mlat=%d nic=%d rc=%d candidate=%u/%u",
+                               plane.callsign, correction_m, correction_gate_m,
+                               measurement_age,
+                               plane.source_type[0] != '\0'
+                                   ? plane.source_type : "unknown",
+                               plane.position_mlat ? 1 : 0, plane.nic, plane.rc,
+                               state.candidate_count, required_candidates);
+                    }
+                  }
+                }
+
+                if (accept_measurement) {
+                  state.anchor_lat = measured_lat;
+                  state.anchor_lon = measured_lon;
+                  state.nose = plane.nose;
+                  state.track = plane.track;
+                  state.ground_speed = plane.ground_speed;
+                  state.anchor_ms = frame_start_ms;
+                  state.motion_valid = true;
+                  state.last_raw_lat = plane.lat;
+                  state.last_raw_lon = plane.lon;
+                  state.last_observation_ms = observation_ms;
+                  state.candidate_valid = false;
+                  state.candidate_count = 0;
+                  if (reacquired) {
+                    id(flight_radar_position_reacquisitions)++;
+                    ESP_LOGI("flight_tracker",
+                             "%s position reacquired after confirmed relocation",
+                             plane.callsign);
+                  }
+                }
+              }
+            }
+
+            const float state_age = std::min(
+                MAX_EXTRAPOLATION_SECONDS,
+                (float) (frame_start_ms - state.anchor_ms) / 1000.0f);
+            plane.predicted_lat = state.anchor_lat;
+            plane.predicted_lon = state.anchor_lon;
+            if (state.motion_valid) {
+              project_motion(state.anchor_lat, state.anchor_lon,
+                             state.track, state.ground_speed, state_age,
+                             plane.predicted_lat, plane.predicted_lon);
+            }
+            plane.nose = state.nose;
+            plane.track = state.track;
+            plane.ground_speed = state.ground_speed;
             plane_count++;
+          }
+          if (new_payload) {
+            tracker_generation = id(flight_radar_payload_generation);
           }
 
           if (label_metrics_generation != id(flight_radar_payload_generation)) {
@@ -3357,8 +3768,11 @@ display:
           id(flight_radar_frame_labels) = placed_label_count;
           id(flight_radar_frame_degraded_labels) = degraded_label_count;
           id(flight_radar_frame_skipped_labels) = skipped_label_count;
-          if (publish_frame_diag
-              || id(flight_radar_frame_duration_ms) > 80UL) {
+          const bool publish_slow_frame_diag =
+              id(flight_radar_frame_duration_ms) > 95UL
+              && frame_start_ms - id(flight_radar_frame_last_diag_ms)
+                     >= 1000UL;
+          if (publish_frame_diag || publish_slow_frame_diag) {
             id(flight_radar_frame_last_diag_ms) = millis();
             id(flight_radar_display_duration_ms_sensor).publish_state(
                 id(flight_radar_frame_duration_ms));

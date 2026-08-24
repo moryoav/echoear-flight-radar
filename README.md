@@ -22,6 +22,8 @@ tracking, interactive flight details, and a local map display.
 
 - Polls nearby aircraft from the free adsb.fi feed every five seconds.
 - Animates aircraft smoothly at a 100 ms display interval between network updates.
+- Compensates for ADS-B source and HTTP delivery age, ignores repeated stale
+  positions, and confirms low-integrity MLAT relocations before displaying them.
 - Draws heading-oriented PNG aircraft icons, speed vectors, range rings, labels,
   and optional runways on the EchoEar's 360 x 360 round display.
 - Switches among range-aligned, label-free OpenStreetMap backgrounds for the
@@ -235,9 +237,11 @@ to a current AeroAPI flight record.
 
 **The display updates but aircraft jump**
 
-Check Wi-Fi quality and the radar fetch diagnostics. Aircraft positions are
-interpolated continuously, but fresh ADS-B positions still depend on the
-five-second upstream polling cycle.
+Check the radar fetch and position diagnostics in Home Assistant. Aircraft are
+extrapolated continuously from source-timestamped observations. Repeated stale
+positions are ignored, while implausible corrections are held until multiple
+distinct observations confirm the relocation. The rejected, reacquired, stale,
+and maximum-correction sensors show when this protection is active.
 
 ## Credits and license
 
