@@ -301,8 +301,7 @@ opening a pull request, and use the structured issue forms for bug reports and
 feature requests. General setup guidance is in [SUPPORT.md](SUPPORT.md).
 
 Please follow the [Code of Conduct](CODE_OF_CONDUCT.md). Report vulnerabilities
-privately according to [SECURITY.md](.github/SECURITY.md), not through a public
-issue.
+privately according to [SECURITY.md](SECURITY.md), not through a public issue.
 
 ## Support me on Ko-fi
 
