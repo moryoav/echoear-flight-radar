@@ -85,4 +85,5 @@ testing that was not possible in the pull request.
 - Make sure the repository validation workflow passes.
 
 For setup questions, see [SUPPORT.md](SUPPORT.md). Report vulnerabilities using
-the process in [SECURITY.md](SECURITY.md), not through a public bug report.
+the process in [SECURITY.md](.github/SECURITY.md), not through a public bug
+report.

@@ -27,5 +27,6 @@ guaranteed.
 ## Privacy and security
 
 Redact credentials, API keys, exact home coordinates, access tokens, private
-URLs, and personal data before sharing diagnostics. Follow [SECURITY.md](SECURITY.md)
-for vulnerabilities rather than posting them in a public support issue.
+URLs, and personal data before sharing diagnostics. Follow
+[SECURITY.md](.github/SECURITY.md) for vulnerabilities rather than posting them
+in a public support issue.
