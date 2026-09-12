@@ -37,6 +37,10 @@ tracking, interactive flight details, and a local map display.
   metadata from FlightAware; estimated time values are prefixed with `~`.
 - Exposes range, units, runway visibility, backlight, touch inputs, battery, and
   diagnostics as native Home Assistant entities.
+- Acts as a Home Assistant Bluetooth proxy with continuous active scanning and
+  two simultaneous BLE connections, using standard scan timings to share Wi-Fi
+  with the radar. Bluetooth buffers use PSRAM to leave internal RAM for HTTPS.
+  The existing ESPHome integration enables the proxy automatically.
 
 HTTP runs in a dedicated ESP-IDF worker. The display and ESPHome main loop only
 receive bounded handoffs, avoiding long TLS requests on the UI path.

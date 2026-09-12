@@ -79,6 +79,20 @@ api:
   on_client_connected:
     - script.execute: flight_radar_fetch
 
+esp32_ble:
+  max_connections: 2
+  use_psram: true
+
+# Keep standard scan timings so Bluetooth shares the radio with radar Wi-Fi.
+esp32_ble_tracker:
+  scan_parameters:
+    active: true
+    continuous: true
+
+bluetooth_proxy:
+  active: true
+  connection_slots: 2
+
 json:
 
 time:
