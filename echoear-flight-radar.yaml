@@ -25,6 +25,11 @@ esp32:
       # Keep TLS buffers out of the internal heap shared with the BLE controller.
       CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC: "n"
       CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: "y"
+      # Let large general allocations use PSRAM while reserving internal DMA RAM.
+      CONFIG_SPIRAM_USE_CAPS_ALLOC: "n"
+      CONFIG_SPIRAM_USE_MALLOC: "y"
+      CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL: "16384"
+      CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL: "32768"
 
 esphome:
   name: ${name}
