@@ -20,6 +20,11 @@ esp32:
       CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: "y"
       CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
       CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+      # ESPHome 2026.8.1 omits this PSRAM preference on the S3.
+      CONFIG_BT_ALLOCATION_FROM_SPIRAM_FIRST: "y"
+      # Keep TLS buffers out of the internal heap shared with the BLE controller.
+      CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC: "n"
+      CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: "y"
 
 esphome:
   name: ${name}

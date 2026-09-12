@@ -39,7 +39,7 @@ tracking, interactive flight details, and a local map display.
   diagnostics as native Home Assistant entities.
 - Acts as a Home Assistant Bluetooth proxy with continuous active scanning and
   two simultaneous BLE connections, using standard scan timings to share Wi-Fi
-  with the radar. Bluetooth buffers use PSRAM to leave internal RAM for HTTPS.
+  with the radar. Bluetooth and TLS buffers use PSRAM to preserve internal RAM.
   The existing ESPHome integration enables the proxy automatically.
 
 HTTP runs in a dedicated ESP-IDF worker. The display and ESPHome main loop only
